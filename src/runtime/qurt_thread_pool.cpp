@@ -3,7 +3,8 @@
 
 using namespace Halide::Runtime::Internal::Qurt;
 
-#define QURT_MUTEX_INIT_FLAG   0xFACEFACEFACEFACE         // some pattern value
+//Pattern to check if mutex is initialized 
+#define QURT_MUTEX_INIT_FLAG   0xFACEFACEFACEFACE 
 
 extern "C" {
 extern void *memalign(size_t, size_t);
@@ -72,7 +73,7 @@ WEAK void halide_mutex_init(halide_mutex *mutex_arg) {
 
 WEAK void halide_mutex_lock(halide_mutex *mutex_arg) {
     qurt_mutex_wrapper_t *pmutex = (qurt_mutex_wrapper_t *)mutex_arg;
-    halide_assert(0, pmutex->init_flag == QURT_MUTEX_INIT_FLAG);             // check mutex is initialized
+    halide_assert(0, pmutex->init_flag == QURT_MUTEX_INIT_FLAG);   //check mutex is initialized
     qurt_mutex_lock((qurt_mutex_t *)&pmutex->mutex);
 }
 
