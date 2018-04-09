@@ -35,6 +35,9 @@ public:
         copy.compute_at(output, tx)
               .store_root()
               .fold_storage(x, tile_width * 2)
+			  //TODO: This is not the location to use copy_to_device for DMA Write
+			  // What changes we need to do to make the copy at Tile level using DMA write to Output
+			  // We are seeing compilation errors when we move this copy_to_device to output pipeline
               .copy_to_device();
 
     }

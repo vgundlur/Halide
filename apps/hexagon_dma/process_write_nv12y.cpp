@@ -24,17 +24,17 @@ int main(int argc, char **argv) {
     }
 
     Halide::Runtime::Buffer<uint8_t> input_validation(memory_to_dma_from, width, height);
-    Halide::Runtime::Buffer<uint8_t> input(nullptr, width, height);
+    Halide::Runtime::Buffer<uint8_t> input(memory_to_dma_from, width, height);
 
     // TODO: We shouldn't need to allocate a host buffer here, but the
     // current implementation of cropping + halide_buffer_copy needs
     // it to work correctly.
-    input.allocate();
+    //input.allocate();
 
     // Give the input the buffer we want to DMA from.
-    input.device_wrap_native(halide_hexagon_dma_device_interface(),
-                             reinterpret_cast<uint64_t>(memory_to_dma_from));
-    input.set_device_dirty();
+    //input.device_wrap_native(halide_hexagon_dma_device_interface(),
+    //                         reinterpret_cast<uint64_t>(memory_to_dma_from));
+    //input.set_device_dirty();
 
     uint8_t *memory_to_dma_to = (uint8_t *)malloc(width * height  );
     Halide::Runtime::Buffer<uint8_t> output(nullptr, width, height); 
@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
     // We then need to prepare for copying to host. Attempting to copy
     // to host without doing this is an error.
     // The Last parameter 0 indicate DMA Read
-    halide_hexagon_dma_prepare_for_copy_to_device(nullptr, input, dma_engine, false, eDmaFmt_NV12_Y);
+    halide_hexagon_dma_prepare_for_copy_to_device(nullptr, output, dma_engine, false, eDmaFmt_NV12_Y);
 
     int result = pipeline_write_nv12y(input, output);
     if (result != 0) {
@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
     }
 
 
-    halide_hexagon_dma_unprepare(nullptr, input);
+    halide_hexagon_dma_unprepare(nullptr, output);
 
     // We're done with the DMA engine, release it. This would also be
     // done automatically by device_free.
