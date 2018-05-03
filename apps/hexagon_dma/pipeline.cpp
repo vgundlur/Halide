@@ -33,7 +33,7 @@ public:
         copy
             .compute_at(output, tx)
             .store_root()
-            .fold_storage(x, tile_width * 2)
+            .fold_storage(x, (tile_width * 2))
             .copy_to_host();
     }
 

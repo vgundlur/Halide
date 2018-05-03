@@ -251,19 +251,19 @@ int32 nDmaWrapper_DmaTransferSetup(t_DmaWrapper_DmaEngineHandle handle, t_StDmaW
             break;
     }
     
-    desc->stWord0.dst_is_ubwc            = dma_transfer_parm->bIsFmtUbwc;
-    desc->stWord0.dst_is_tcm             = (dma_transfer_parm->eTransferType == eDmaWrapper_DdrToL2) ? 1 : 0;
-    desc->stWord0.frm_height             = dma_transfer_parm->u16FrameH;
-    desc->stWord0.frm_width              = dma_transfer_parm->u16FrameW;
-    desc->stWord0.roiX                   = dma_transfer_parm->u16RoiX;
-    desc->stWord0.roiY                   = dma_transfer_parm->u16RoiY / mul_factor;
-    desc->stWord1.roiH                   = dma_transfer_parm->u16RoiH / mul_factor;
-    desc->stWord1.roiW                   = dma_transfer_parm->u16RoiW;
-    desc->stWord1.src_roi_stride         = dma_transfer_parm->u16FrameStride;
-    desc->stWord1.dst_roi_stride         = dma_transfer_parm->u16RoiStride;
-    desc->stWord1.dst_frm_base_addr      = reinterpret_cast<uintptr_t>(dma_transfer_parm->pTcmDataBuf);
-    desc->stWord1.src_frm_base_addr      = reinterpret_cast<uintptr_t>(dma_transfer_parm->pFrameBuf);    // must always point to start of frame buffer, and not start of component
-    desc->stWord2.pix_fmt                = dma_transfer_parm->eFmt;
+    desc->stWord0.dst_is_ubwc           = dma_transfer_parm->bIsFmtUbwc;
+    desc->stWord0.dst_is_tcm            = (dma_transfer_parm->eTransferType == eDmaWrapper_DdrToL2) ? 1 : 0;
+    desc->stWord0.frm_height            = dma_transfer_parm->u16FrameH;
+    desc->stWord0.frm_width             = dma_transfer_parm->u16FrameW;
+    desc->stWord0.roiX                  = dma_transfer_parm->u16RoiX;
+    desc->stWord0.roiY                  = dma_transfer_parm->u16RoiY / mul_factor;
+    desc->stWord1.roiH                  = dma_transfer_parm->u16RoiH / mul_factor;
+    desc->stWord1.roiW                  = dma_transfer_parm->u16RoiW;
+    desc->stWord1.src_roi_stride        = dma_transfer_parm->u16FrameStride;
+    desc->stWord1.dst_roi_stride        = dma_transfer_parm->u16RoiStride;
+    desc->stWord1.dst_frm_base_addr     = reinterpret_cast<uintptr_t>(dma_transfer_parm->pTcmDataBuf);
+    desc->stWord1.src_frm_base_addr     = reinterpret_cast<uintptr_t>(dma_transfer_parm->pFrameBuf);    // must always point to start of frame buffer, and not start of component
+    desc->stWord2.pix_fmt               = dma_transfer_parm->eFmt;
     
     return 0;
 
