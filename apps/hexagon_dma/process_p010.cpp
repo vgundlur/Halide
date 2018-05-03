@@ -18,8 +18,9 @@ int main(int argc, char **argv) {
     const int height = atoi(argv[2]);
 
     // Fill the input buffer with random data. This is just a plain old memory buffer
-    uint16_t *memory_to_dma_from = (uint16_t *)malloc(width * height * 1.5 * sizeof(uint16_t));
-    for (int i = 0; i < width * height * 1.5;  i++) {
+    const int buf_size = width * height * 1.5;
+    uint16_t *memory_to_dma_from = (uint16_t *)malloc(buf_size * sizeof(uint16_t));
+    for (int i = 0; i < buf_size;  i++) {
         memory_to_dma_from[i] = ((uint16_t)rand()) >> 1;
     }
 
@@ -56,18 +57,17 @@ int main(int argc, char **argv) {
     }
 
     output.copy_to_host();
-    int c = 2;
     const int plane_start = 0;
-    const int plane_end = c;
+    const int plane_end = 2;
     printf("plane start=%d end=%d\n", plane_start, plane_end);
-    for (int z = plane_start; z < plane_end; z++) {
-        int height_c = (z==1) ? height/2 : height;
+    for (int c = plane_start; c < plane_end; c++) {
+        int height_c = (c==1) ? height/2 : height;
         for (int y = 0; y < height_c; y++) {
             for (int x = 0; x < width; x++) {
-                uint16_t correct = memory_to_dma_from[x + y*width + z*width*height] * 2;
-                if (correct != output(x, y, z)) {
+                uint16_t correct = memory_to_dma_from[x + y*width + c*width*height] * 2;
+                if (correct != output(x, y, c)) {
                     static int cnt = 0;
-                    printf("Mismatch at x=%d y=%d c=%d : %d != %d\n", x, y, z, correct, output(x, y, z));
+                    printf("Mismatch at x=%d y=%d c=%d : %d != %d\n", x, y, c, correct, output(x, y, c));
                     if (++cnt > 20) abort();
                 }
             }
