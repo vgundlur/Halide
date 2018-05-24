@@ -18,31 +18,38 @@ int main(int argc, char **argv) {
     const int height = atoi(argv[2]);
 
     // Fill the input buffer with random data. This is just a plain old memory buffer
-    
     const int buf_size = width * height;
-    uint8_t *memory_to_dma_from = (uint8_t *)malloc(buf_size);
+    uint8_t *data_in = (uint8_t *)malloc(buf_size);
+    uint8_t *data_out = (uint8_t *)malloc(buf_size);
+
     // Creating the Input Data so that we can catch if there are any Errors in DMA   
-    int *pDataIn = reinterpret_cast<int *>(memory_to_dma_from);
+    int *data_in_int = reinterpret_cast<int *>(data_in);
     for (int i = 0; i < (buf_size >> 2);  i++) {
-        pDataIn[i] = i;
+        data_in_int[i] = i;
     }
-    Halide::Runtime::Buffer<uint8_t> input_validation(memory_to_dma_from, width, height, 2);
-    Halide::Runtime::Buffer<uint8_t> input(nullptr, width, height);
 
     void *dma_engine = nullptr;
     halide_hexagon_dma_allocate_engine(nullptr, &dma_engine);
-    
-    input.allocate();
 
+    //input buffer which wraps the read ion buffer 
+    Halide::Runtime::Buffer<uint8_t> input(nullptr, width, height);
 
     input.device_wrap_native(halide_hexagon_dma_device_interface(),
-                             reinterpret_cast<uint64_t>(memory_to_dma_from));
-
+                             reinterpret_cast<uint64_t>(data_in));
+  
+    //copying to cache To Do what if the input and output format differs?
     halide_hexagon_dma_prepare_for_copy_to_host(nullptr, input, dma_engine, false, eDmaFmt_NV12_Y);
-
     input.set_device_dirty();
-    
-    Halide::Runtime::Buffer<uint8_t> output(width, height);
+
+    //output buffer which wraps the write ion buffer
+    Halide::Runtime::Buffer<uint8_t> output(nullptr, width, height);
+    output.device_wrap_native(halide_hexagon_dma_device_interface(),
+                             reinterpret_cast<uint64_t>(data_out));
+   
+    //copying from cache to device To Do what if the input and output format differs ?
+    halide_hexagon_dma_prepare_for_copy_to_device(nullptr, output, dma_engine, false, eDmaFmt_NV12_Y); 
+    output.set_host_dirty();
+    output.allocate();
 
     int result = pipeline_nv12y_write(input, output);
     if (result != 0) {
@@ -51,23 +58,25 @@ int main(int argc, char **argv) {
 
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            uint8_t correct = memory_to_dma_from[x + y * width] * 2;
-            if (correct != output(x, y)) {
+            uint8_t correct = data_in[x + y * width] * 2;
+            if (correct != data_out[x + y * width]) {
                 static int cnt = 0;
-                printf("Mismatch at x=%d y=%d : %d != %d\n", x, y, correct, output(x, y));
+                printf("Mismatch at x=%d y=%d : %d != %d\n", x, y, correct, data_out[x + y * width]);
                 if (++cnt > 20) abort();
             }
         }
     }
     
     halide_hexagon_dma_unprepare(nullptr, input);
+    halide_hexagon_dma_unprepare(nullptr, output);
 
     // We're done with the DMA engine, release it. This would also be
     // done automatically by device_free.
     halide_hexagon_dma_deallocate_engine(nullptr, dma_engine);
 
-    free(memory_to_dma_from);
-
+    free(data_in);
+    free(data_out);
+   
     printf("Success!\n");
     return 0;
 }

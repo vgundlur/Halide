@@ -131,14 +131,18 @@ static void desc_pool_free (void *user_context) {
     }
 }
 
-static inline void copy_from_cache(uint8_t *src, uint8_t *dest, int roi_height,
-           int roi_stride, int dest_stride, int pixelsize, int linesize) {
+static inline void copy_read_write(uint8_t *cache, uint8_t *tmp, int roi_height,
+           int roi_stride, int dest_stride, int pixelsize, int linesize, bool is_write) {
     for (int y = 0; y < roi_height; y++) {
-        int sy = y * roi_stride * pixelsize;
-        int dy = y * dest_stride * pixelsize;
-        memcpy(&dest[dy], &src[sy], linesize);
+        int cy = y * roi_stride * pixelsize;
+        int ty = y * dest_stride * pixelsize;
+        if (is_write) {
+            memcpy(&cache[cy], &tmp[ty], linesize); 
+        } else {
+            memcpy(&tmp[ty], &cache[cy], linesize);
+        }
     }
-} 
+}
 
 static int halide_hexagon_dma_wrapper (void *user_context, struct halide_buffer_t *src,
                                        struct halide_buffer_t *dst) {
@@ -193,11 +197,29 @@ static int halide_hexagon_dma_wrapper (void *user_context, struct halide_buffer_
 
     // Copy from Locked Cache to a temp DDR buffer
     // TODO: This should be removed once the cache locking is addressed inside Halide Pipeline
+    // For DMA Write the cache buffer address should come from input_buf->dmaread->cache_allocation 
     int buf_size = roi_stride * roi_height * dst->type.bytes();
     debug(user_context) << " cache buffer size " << buf_size << "\n";
     if (dev->cache_buf == 0) {
         dev->cache_buf = HAP_cache_lock(buf_size, 0);
     }
+
+    uint8_t *dest = reinterpret_cast<uint8_t *>(dst->host);
+
+    // TODO: This should be removed once the cache locking is addressed inside Halide Pipeline
+    const int pixelsize = dst->type.bytes();
+    const int linesize = roi_width * pixelsize;
+    uint8_t *cache_buf = reinterpret_cast<uint8_t *>(dev->cache_buf);
+
+    debug(user_context)
+        << "copy cache: " << "pixelsize= " << pixelsize << " linesize= " << linesize << "\n";
+    
+    //TODO Implement DMA Write through IR Cache for o/p to come from input
+    // if write function copy from dst->host to cache for dma write transfer 
+    if (dest && (dev->is_write)) {
+        copy_read_write(cache_buf, dest, roi_height, roi_stride, dst->dim[1].stride, pixelsize, linesize, 1);
+    }
+    
     // TODO: Currently we can only handle 2-D RAW Format, Will revisit this later for > 2-D
     // We need to make some adjustment to H, X and Y parameters for > 2-D RAW Format
     // because DMA treat RAW as a flattened buffer
@@ -261,17 +283,10 @@ static int halide_hexagon_dma_wrapper (void *user_context, struct halide_buffer_
         return halide_error_code_device_buffer_copy_failed;
     }
 
-    uint8_t *dest = reinterpret_cast<uint8_t *>(dst->host);
-
-    // Copy from Locked Cache to a temp DDR buffer
+    // Copy from Locked Cache to a temp DDR buffer dst->host
     // TODO: This should be removed once the cache locking is addressed inside Halide Pipeline
-    if (dest) {
-        const int pixelsize = dst->type.bytes();
-        const int linesize = roi_width * pixelsize;
-        uint8_t *cache_buf = reinterpret_cast<uint8_t *>(dev->cache_buf);
-        debug(user_context)
-            << "copy cache: " << "pixelsize= " << pixelsize << " linesize= " << linesize << "\n";
-        copy_from_cache(cache_buf, dest, roi_height, roi_stride, dst->dim[1].stride, pixelsize, linesize); 
+    if (dest && !dev->is_write) {
+        copy_read_write(cache_buf, dest, roi_height, roi_stride, dst->dim[1].stride, pixelsize, linesize, 0); 
     }
 
     desc_pool_put(user_context, desc_addr);
@@ -363,8 +378,8 @@ WEAK int halide_hexagon_dma_deallocate_engine(void *user_context, void *dma_engi
     return halide_error_code_success;
 }
 
-
 inline int dma_prepare_for_copy(void *user_context, struct halide_buffer_t *buf, void *dma_engine, bool is_ubwc, int fmt, bool is_write ) {
+
     halide_assert(user_context, dma_engine);
     dma_device_handle *dev = reinterpret_cast<dma_device_handle *>(buf->device);
     dev->dma_engine = dma_engine;
@@ -378,19 +393,17 @@ inline int dma_prepare_for_copy(void *user_context, struct halide_buffer_t *buf,
         (dev->fmt == eDmaFmt_NV124R_UV)) {
         dev->frame_height = dev->frame_height * 2;
     }
-
     return halide_error_code_success;
 }
-
 
 WEAK int halide_hexagon_dma_prepare_for_copy_to_host(void *user_context, struct halide_buffer_t *buf,
                                                      void *dma_engine, bool is_ubwc, int fmt ) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_prepare_for_copy_to_host (user_context: " << user_context
         << ", buf: " << buf << ", dma_engine: " << dma_engine << ")\n";
-
     return dma_prepare_for_copy(user_context, buf, dma_engine, is_ubwc, fmt, 0);
 }
+
 WEAK int halide_hexagon_dma_prepare_for_copy_to_device(void *user_context, struct halide_buffer_t *buf,
                                                      void *dma_engine, bool is_ubwc, int fmt ) {
     debug(user_context)
@@ -429,6 +442,11 @@ WEAK int halide_hexagon_dma_buffer_copy(void *user_context, struct halide_buffer
                                         struct halide_buffer_t *dst) {
     // We only handle copies to hexagon_dma or to host
     // TODO: does device to device via DMA make sense?
+    debug(user_context)
+        << "Hexagon: halide_hexagon_dma_buffer_copy (user_context: " << user_context
+        << ", src: " << src << ", dst: " << dst << ")\n";
+ 
+
     halide_assert(user_context, dst_device_interface == NULL ||
                   dst_device_interface == &hexagon_dma_device_interface);
 
@@ -448,18 +466,20 @@ WEAK int halide_hexagon_dma_buffer_copy(void *user_context, struct halide_buffer
     bool from_host = !src->device_dirty() && src->host != NULL;
     bool to_host = !dst_device_interface;
 
+    debug(user_context) << "from_host %d\n" << from_host;
+    debug(user_context) << "to_host %d\n" <<  to_host;
+
     halide_assert(user_context, from_host || src->device);
     halide_assert(user_context, to_host || dst->device);
 
-    // For now only copy device to host.
-    // TODO: Figure out which other paths can be supported.
-    halide_assert(user_context, !from_host && to_host);
-
-    debug(user_context)
-        << "Hexagon: halide_hexagon_dma_buffer_copy (user_context: " << user_context
-        << ", src: " << src << ", dst: " << dst << ")\n";
-
-    int nRet = halide_hexagon_dma_wrapper(user_context, src, dst);
+    int nRet = 0;
+    //Add check for dst_device_interface == hexagon_dma_device_interface and dma write
+    if (dst_device_interface == &hexagon_dma_device_interface) {
+        //where dst is output buffer and src is temp buffer
+        nRet = halide_hexagon_dma_wrapper(user_context, dst, src); 
+    } else {
+        nRet = halide_hexagon_dma_wrapper(user_context, src, dst);
+    }
    
     return nRet;
 }
@@ -467,7 +487,7 @@ WEAK int halide_hexagon_dma_buffer_copy(void *user_context, struct halide_buffer
 WEAK int halide_hexagon_dma_copy_to_device(void *user_context, halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_copy_to_device (user_context: " << user_context
-        << ", halide_buffer_t: " << buf << ")\n";
+        << ", buf: " << buf << ")\n";
 
     // TODO: Implement this with dma_move_data.
     error(user_context) << "halide_hexagon_dma_copy_to_device not implemented.\n";
@@ -477,14 +497,16 @@ WEAK int halide_hexagon_dma_copy_to_device(void *user_context, halide_buffer_t *
 WEAK int halide_hexagon_dma_copy_to_host(void *user_context, struct halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_copy_to_host (user_context: " << user_context
-        << ", halide_buffer_t: " << buf << ")\n";
+        << ", buf: " << buf << ")\n";
 
 // TODO: pending cleanup to match halide_hexagon_dma_buffer_copy()'s functional correctness
 // Halide currently is not using this function.
 #if 1
-    // until then, return ERROR
-    error(user_context) << "halide_hexagon_dma_copy_to_host not implemented.\n";
-    return halide_error_code_copy_to_device_failed;
+    //TODO : Returning success because current IR for dma write calls copy_to_host() on output 
+    //buffer whereas we need to copy to output->device. Also need to know what will eventually be implemented 
+    //in this copy_to_host()
+    debug(user_context) << "halide_hexagon_dma_copy_to_host not implemented but returning no errror now\n";
+    return halide_error_code_success;
 #else
     halide_assert(user_context, buf->host && buf->device);
     dma_device_handle *dev = (dma_device_handle *)buf->device;
@@ -570,7 +592,7 @@ WEAK int halide_hexagon_dma_device_crop(void *user_context,
                                         struct halide_buffer_t *dst) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_crop (user_context: " << user_context
-        << " halide_buffer_t src: " << src << " halide_buffer_t dst: " << dst << ")\n";
+        << " src: " << src << " dst: " << dst << ")\n";
 
     dst->device_interface = src->device_interface;
 
@@ -590,7 +612,7 @@ WEAK int halide_hexagon_dma_device_crop(void *user_context,
 WEAK int halide_hexagon_dma_device_release_crop(void *user_context, struct halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_release_crop (user_context: " << user_context
-        << " halide_buffer_t: " << buf << ")\n";
+        << " buf: " << buf << ")\n";
 
     halide_assert(user_context, buf->device);
     free((dma_device_handle *)buf->device);
@@ -602,7 +624,7 @@ WEAK int halide_hexagon_dma_device_release_crop(void *user_context, struct halid
 WEAK int halide_hexagon_dma_device_sync(void *user_context, struct halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_sync (user_context: " << user_context
-        << " halide_buffer_t: " << buf << ")\n";
+        << " buf: " << buf << ")\n";
 
     dma_device_handle *dev = (dma_device_handle *)buf->device;
     halide_assert(user_context, dev->dma_engine);
@@ -620,7 +642,7 @@ WEAK int halide_hexagon_dma_device_wrap_native(void *user_context, struct halide
                                                uint64_t handle) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_wrap_native (user_context: " << user_context
-        << " halide_buffer_t: " << buf << " handle: " << handle << ")\n";
+        << " buf: " << buf << " handle: " << handle << ")\n";
 
     halide_assert(user_context, buf->device == 0);
     if (buf->device != 0) {
@@ -645,7 +667,7 @@ WEAK int halide_hexagon_dma_device_wrap_native(void *user_context, struct halide
 WEAK int halide_hexagon_dma_device_detach_native(void *user_context, struct halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_detach_native (user_context: " << user_context
-        << " halide_buffer_t: " << buf << ")\n";
+        << " buf: " << buf << ")\n";
 
     if (buf->device == 0) {
         return NULL;
@@ -663,7 +685,7 @@ WEAK int halide_hexagon_dma_device_detach_native(void *user_context, struct hali
 WEAK int halide_hexagon_dma_device_and_host_malloc(void *user_context, struct halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_and_host_malloc (user_context: " << user_context
-        << " halide_buffer_t: " << buf << ")\n";
+        << " buf: " << buf << ")\n";
 
     return halide_default_device_and_host_malloc(user_context, buf, &hexagon_dma_device_interface);
 }
@@ -671,7 +693,7 @@ WEAK int halide_hexagon_dma_device_and_host_malloc(void *user_context, struct ha
 WEAK int halide_hexagon_dma_device_and_host_free(void *user_context, struct halide_buffer_t *buf) {
     debug(user_context)
         << "Hexagon: halide_hexagon_dma_device_and_host_free (user_context: " << user_context
-        << " halide_buffer_t: " << buf << ")\n";
+        << " buf: " << buf << ")\n";
 
     return halide_default_device_and_host_free(user_context, buf, &hexagon_dma_device_interface);
 }
@@ -706,7 +728,7 @@ WEAK halide_device_interface_impl_t hexagon_dma_device_interface_impl = {
     halide_hexagon_dma_device_crop,
     halide_hexagon_dma_device_release_crop,
     halide_hexagon_dma_device_wrap_native,
-    halide_hexagon_dma_device_detach_native,
+    halide_hexagon_dma_device_detach_native
 };
 
 WEAK halide_device_interface_t hexagon_dma_device_interface = {
@@ -727,3 +749,4 @@ WEAK halide_device_interface_t hexagon_dma_device_interface = {
 };
 
 }}}} // namespace Halide::Runtime::Internal::HexagonDma
+
