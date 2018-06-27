@@ -337,11 +337,13 @@ WEAK int halide_hexagon_dma_deallocate_engine(void *user_context, void *dma_engi
     desc_pool_free(user_context);
 
     int err = nDmaWrapper_FreeDma((t_DmaWrapper_DmaEngineHandle)dma_engine);
+    debug(user_context) << "    dma_free_dma_engine done\n";
     if (err != 0) {
         error(user_context) << "Freeing DMA Engine failed.\n";
         return halide_error_code_generic_error;
     }
     //free cache pool
+    debug(user_context) << "halide_hexagon_free_l2_pool\n"; 
     err = halide_hexagon_free_l2_pool(user_context);
     if (err != 0) {
         error(user_context) << "Freeing Cache Pool failed.\n";

@@ -2,12 +2,10 @@
 
 using namespace Halide;
 
-#define DIM 4
-
 class DmaPipeline : public Generator<DmaPipeline> {
 public:
-    Input<Buffer<uint8_t>> input{"input", DIM};
-    Output<Buffer<uint8_t>> output{"output", DIM};
+    Input<Buffer<uint8_t>> input{"input", 4};
+    Output<Buffer<uint8_t>> output{"output", 4};
 
     void generate() {
         Var x{"x"}, y{"y"}, c("c"), t("t");
