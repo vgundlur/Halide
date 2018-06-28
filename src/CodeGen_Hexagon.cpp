@@ -1,1852 +1,2156 @@
-# 'make' builds libHalide.a, the internal test suite, and runs the internal test suite
-# 'make run_tests' builds and runs all the end-to-end tests in the test subdirectory
-# 'make {error,performance}_foo' builds and runs test/{...}/foo.cpp for any
-#     cpp file in the corresponding subdirectory of the test folder
-# 'make test_foo' builds and runs test/correctness/foo.cpp for any
-#     cpp file in the correctness/ subdirectoy of the test folder
-# 'make test_apps' checks some of the apps build and run (but does not check their output)
-# 'make time_compilation_tests' records the compile time for each test module into a csv file.
-#     For correctness and performance tests this include halide build time and run time. For
-#     the tests in test/generator/ this times only the halide build time.
-
-UNAME = $(shell uname)
-
-ifeq ($(OS), Windows_NT)
-    # assume we are building for the MinGW environment
-    COMMON_LD_FLAGS=-luuid -lole32 -lpthread -lz -Wl,--stack,8388608
-    SHARED_EXT=dll
-    FPIC=
-else
-    # let's assume "normal" UNIX such as linux
-    COMMON_LD_FLAGS=-ldl -lpthread -lz
-    FPIC=-fPIC
-ifeq ($(UNAME), Darwin)
-    SHARED_EXT=dylib
-else
-    SHARED_EXT=so
-endif
-endif
-
-ifeq ($(UNAME), Darwin)
-  # Anything that we us install_name_tool on needs these linker flags
-  # to ensure there is enough padding for install_name_tool to use
-  INSTALL_NAME_TOOL_LD_FLAGS=-Wl,-headerpad_max_install_names
-else
-  INSTALL_NAME_TOOL_LD_FLAGS=
-endif
-
-BAZEL ?= $(shell which bazel)
-
-SHELL = bash
-CXX ?= g++
-PREFIX ?= /usr/local
-LLVM_CONFIG ?= llvm-config
-LLVM_COMPONENTS= $(shell $(LLVM_CONFIG) --components)
-LLVM_VERSION = $(shell $(LLVM_CONFIG) --version | cut -b 1-3)
-
-LLVM_FULL_VERSION = $(shell $(LLVM_CONFIG) --version)
-CLANG ?= clang
-CLANG_VERSION = $(shell $(CLANG) --version)
-LLVM_BINDIR = $(shell $(LLVM_CONFIG) --bindir | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
-LLVM_LIBDIR = $(shell $(LLVM_CONFIG) --libdir | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
-LLVM_SYSTEM_LIBS=$(shell ${LLVM_CONFIG} --system-libs --link-static | sed -e 's/[\/&]/\\&/g')
-LLVM_AS = $(LLVM_BINDIR)/llvm-as
-LLVM_NM = $(LLVM_BINDIR)/llvm-nm
-LLVM_CXX_FLAGS = -std=c++11  $(filter-out -O% -g -fomit-frame-pointer -pedantic -W% -W, $(shell $(LLVM_CONFIG) --cxxflags | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g;s/-D/ -D/g;s/-O/ -O/g'))
-OPTIMIZE ?= -O3
-OPTIMIZE_FOR_BUILD_TIME ?= -O0
-
-SANITIZER_FLAGS ?=
-
-# TODO: this is suboptimal hackery; we should really add the relevant
-# support libs for the sanitizer(s) as weak symbols in Codegen_LLVM.
-# (Note also that, in general, most Sanitizers work most reliably with an all-Clang
-# build system.)
-
-ifneq (,$(findstring tsan,$(HL_TARGET)$(HL_JIT_TARGET)))
-
-# Note that attempting to use TSAN with the JIT can produce false positives
-# if libHalide is not also compiled with TSAN enabled; we tack the relevant
-# flag onto OPTIMIZE here, but that's really only effective if you ensure
-# to do a clean build before testing. (In general, most of the Sanitizers
-# only work well when used in a completely clean environment.)
-OPTIMIZE += -fsanitize=thread
-SANITIZER_FLAGS += -fsanitize=thread
-
-endif
-
-ifneq (,$(findstring asan,$(HL_TARGET)$(HL_JIT_TARGET)))
-OPTIMIZE += -fsanitize=address
-SANITIZER_FLAGS += -fsanitize=address
-endif
-
-COMMON_LD_FLAGS += $(SANITIZER_FLAGS)
-
-LLVM_VERSION_TIMES_10 = $(shell $(LLVM_CONFIG) --version | cut -b 1,3)
-
-LLVM_CXX_FLAGS += -DLLVM_VERSION=$(LLVM_VERSION_TIMES_10)
-
-# All WITH_* flags are either empty or not-empty. They do not behave
-# like true/false values in most languages.  To turn one off, either
-# edit this file, add "WITH_FOO=" (no assigned value) to the make
-# line, or define an environment variable WITH_FOO that has an empty
-# value.
-WITH_X86 ?= $(findstring x86, $(LLVM_COMPONENTS))
-WITH_ARM ?= $(findstring arm, $(LLVM_COMPONENTS))
-WITH_HEXAGON ?= $(findstring hexagon, $(LLVM_COMPONENTS))
-WITH_MIPS ?= $(findstring mips, $(LLVM_COMPONENTS))
-WITH_AARCH64 ?= $(findstring aarch64, $(LLVM_COMPONENTS))
-WITH_POWERPC ?= $(findstring powerpc, $(LLVM_COMPONENTS))
-WITH_PTX ?= $(findstring nvptx, $(LLVM_COMPONENTS))
-# AMDGPU target is WIP
-WITH_AMDGPU ?= $(findstring amdgpu, $(LLVM_COMPONENTS))
-WITH_OPENCL ?= not-empty
-WITH_METAL ?= not-empty
-WITH_OPENGL ?= not-empty
-ifeq ($(OS), Windows_NT)
-    WITH_INTROSPECTION ?=
-else
-    WITH_INTROSPECTION ?= not-empty
-endif
-WITH_EXCEPTIONS ?=
-WITH_LLVM_INSIDE_SHARED_LIBHALIDE ?= not-empty
-
-# If HL_TARGET or HL_JIT_TARGET aren't set, use host
-HL_TARGET ?= host
-HL_JIT_TARGET ?= host
-
-X86_CXX_FLAGS=$(if $(WITH_X86), -DWITH_X86=1, )
-X86_LLVM_CONFIG_LIB=$(if $(WITH_X86), x86, )
-
-ARM_CXX_FLAGS=$(if $(WITH_ARM), -DWITH_ARM=1, )
-ARM_LLVM_CONFIG_LIB=$(if $(WITH_ARM), arm, )
-
-MIPS_CXX_FLAGS=$(if $(WITH_MIPS), -DWITH_MIPS=1, )
-MIPS_LLVM_CONFIG_LIB=$(if $(WITH_MIPS), mips, )
-
-POWERPC_CXX_FLAGS=$(if $(WITH_POWERPC), -DWITH_POWERPC=1, )
-POWERPC_LLVM_CONFIG_LIB=$(if $(WITH_POWERPC), powerpc, )
-
-PTX_CXX_FLAGS=$(if $(WITH_PTX), -DWITH_PTX=1, )
-PTX_LLVM_CONFIG_LIB=$(if $(WITH_PTX), nvptx, )
-PTX_DEVICE_INITIAL_MODULES=$(if $(WITH_PTX), libdevice.compute_20.10.bc libdevice.compute_30.10.bc libdevice.compute_35.10.bc, )
-
-AMDGPU_CXX_FLAGS=$(if $(WITH_AMDGPU), -DWITH_AMDGPU=1, )
-AMDGPU_LLVM_CONFIG_LIB=$(if $(WITH_AMDGPU), amdgpu, )
-# TODO add bitcode files
-
-OPENCL_CXX_FLAGS=$(if $(WITH_OPENCL), -DWITH_OPENCL=1, )
-OPENCL_LLVM_CONFIG_LIB=$(if $(WITH_OPENCL), , )
-
-METAL_CXX_FLAGS=$(if $(WITH_METAL), -DWITH_METAL=1, )
-METAL_LLVM_CONFIG_LIB=$(if $(WITH_METAL), , )
-
-OPENGL_CXX_FLAGS=$(if $(WITH_OPENGL), -DWITH_OPENGL=1, )
-
-AARCH64_CXX_FLAGS=$(if $(WITH_AARCH64), -DWITH_AARCH64=1, )
-AARCH64_LLVM_CONFIG_LIB=$(if $(WITH_AARCH64), aarch64, )
-
-INTROSPECTION_CXX_FLAGS=$(if $(WITH_INTROSPECTION), -DWITH_INTROSPECTION, )
-EXCEPTIONS_CXX_FLAGS=$(if $(WITH_EXCEPTIONS), -DWITH_EXCEPTIONS, )
-
-HEXAGON_CXX_FLAGS=$(if $(WITH_HEXAGON), -DWITH_HEXAGON=1, )
-HEXAGON_LLVM_CONFIG_LIB=$(if $(WITH_HEXAGON), hexagon, )
-
-LLVM_HAS_NO_RTTI = $(findstring -fno-rtti, $(LLVM_CXX_FLAGS))
-WITH_RTTI ?= $(if $(LLVM_HAS_NO_RTTI),, not-empty)
-RTTI_CXX_FLAGS=$(if $(WITH_RTTI), , -fno-rtti )
-
-CXX_WARNING_FLAGS = -Wall -Werror -Wno-unused-function -Wcast-qual -Wignored-qualifiers -Wno-comment -Wsign-compare -Wno-unknown-warning-option -Wno-psabi
-CXX_FLAGS = $(CXX_WARNING_FLAGS) $(RTTI_CXX_FLAGS) -Woverloaded-virtual $(FPIC) $(OPTIMIZE) -fno-omit-frame-pointer -DCOMPILING_HALIDE
-
-CXX_FLAGS += $(LLVM_CXX_FLAGS)
-CXX_FLAGS += $(PTX_CXX_FLAGS)
-CXX_FLAGS += $(ARM_CXX_FLAGS)
-CXX_FLAGS += $(HEXAGON_CXX_FLAGS)
-CXX_FLAGS += $(AARCH64_CXX_FLAGS)
-CXX_FLAGS += $(X86_CXX_FLAGS)
-CXX_FLAGS += $(OPENCL_CXX_FLAGS)
-CXX_FLAGS += $(METAL_CXX_FLAGS)
-CXX_FLAGS += $(OPENGL_CXX_FLAGS)
-CXX_FLAGS += $(MIPS_CXX_FLAGS)
-CXX_FLAGS += $(POWERPC_CXX_FLAGS)
-CXX_FLAGS += $(INTROSPECTION_CXX_FLAGS)
-CXX_FLAGS += $(EXCEPTIONS_CXX_FLAGS)
-CXX_FLAGS += $(AMDGPU_CXX_FLAGS)
-
-# This is required on some hosts like powerpc64le-linux-gnu because we may build
-# everything with -fno-exceptions.  Without -funwind-tables, libHalide.so fails
-# to propagate exceptions and causes a test failure.
-CXX_FLAGS += -funwind-tables
-
-print-%:
-	@echo '$*=$($*)'
-
-LLVM_STATIC_LIBS = -L $(LLVM_LIBDIR) $(shell $(LLVM_CONFIG) --link-static --libs bitwriter bitreader linker ipo mcjit $(X86_LLVM_CONFIG_LIB) $(ARM_LLVM_CONFIG_LIB) $(OPENCL_LLVM_CONFIG_LIB) $(METAL_LLVM_CONFIG_LIB) $(PTX_LLVM_CONFIG_LIB) $(AARCH64_LLVM_CONFIG_LIB) $(MIPS_LLVM_CONFIG_LIB) $(POWERPC_LLVM_CONFIG_LIB) $(HEXAGON_LLVM_CONFIG_LIB) $(AMDGPU_LLVM_CONFIG_LIB))
-
-# Add a rpath to the llvm used for linking, in case multiple llvms are
-# installed. Bakes a path on the build system into the .so, so don't
-# use this config for distributions.
-LLVM_SHARED_LIBS = -Wl,-rpath=$(LLVM_LIBDIR) -L $(LLVM_LIBDIR) -lLLVM
-
-LLVM_LIBS_FOR_SHARED_LIBHALIDE=$(if $(WITH_LLVM_INSIDE_SHARED_LIBHALIDE),$(LLVM_STATIC_LIBS),$(LLVM_SHARED_LIBS))
-
-TUTORIAL_CXX_FLAGS ?= -std=c++11 -g -fno-omit-frame-pointer -fno-rtti -I $(ROOT_DIR)/tools $(SANITIZER_FLAGS)
-# The tutorials contain example code with warnings that we don't want
-# to be flagged as errors, so the test flags are the tutorial flags
-# plus our warning flags.
-# Also allow tests, via conditional compilation, to use the entire
-# capability of the CPU being compiled on via -march=native. This
-# presumes tests are run on the smae machine they are compiled on.
-TEST_CXX_FLAGS ?= $(TUTORIAL_CXX_FLAGS) $(CXX_WARNING_FLAGS) -march=native
-TEST_LD_FLAGS = -L$(BIN_DIR) -lHalide $(COMMON_LD_FLAGS)
-
-# gcc 4.8 fires a bogus warning on old versions of png.h
-CXX_VERSION = $(shell $(CXX) --version | head -n1)
-ifneq (,$(findstring g++,$(CXX_VERSION)))
-ifneq (,$(findstring 4.8,$(CXX_VERSION)))
-TEST_CXX_FLAGS += -Wno-literal-suffix
-endif
-endif
-
-ifeq ($(UNAME), Linux)
-TEST_LD_FLAGS += -rdynamic -Wl,--rpath=$(CURDIR)/$(BIN_DIR)
-endif
-
-ifeq ($(WITH_LLVM_INSIDE_SHARED_LIBHALIDE), )
-TEST_LD_FLAGS += -Wl,--rpath=$(LLVM_LIBDIR)
-endif
-
-ifneq ($(WITH_PTX), )
-ifneq (,$(findstring ptx,$(HL_TARGET)))
-TEST_CUDA = 1
-endif
-ifneq (,$(findstring cuda,$(HL_TARGET)))
-TEST_CUDA = 1
-endif
-endif
-
-ifneq ($(WITH_OPENCL), )
-ifneq (,$(findstring opencl,$(HL_TARGET)))
-TEST_OPENCL = 1
-endif
-endif
-
-ifneq ($(WITH_METAL), )
-ifneq (,$(findstring metal,$(HL_TARGET)))
-TEST_METAL = 1
-endif
-endif
-
-ifeq ($(UNAME), Linux)
-ifneq ($(TEST_CUDA), )
-CUDA_LD_FLAGS ?= -L/usr/lib/nvidia-current -lcuda
-endif
-ifneq ($(TEST_OPENCL), )
-OPENCL_LD_FLAGS ?= -lOpenCL
-endif
-OPENGL_LD_FLAGS ?= -lGL
-HOST_OS=linux
-endif
-
-ifeq ($(UNAME), Darwin)
-# Someone with an osx box with cuda installed please fix the line below
-ifneq ($(TEST_CUDA), )
-CUDA_LD_FLAGS ?= -L/usr/local/cuda/lib -lcuda
-endif
-ifneq ($(TEST_OPENCL), )
-OPENCL_LD_FLAGS ?= -framework OpenCL
-endif
-ifneq ($(TEST_METAL), )
-METAL_LD_FLAGS ?= -framework Metal -framework Foundation
-endif
-OPENGL_LD_FLAGS ?= -framework OpenGL
-HOST_OS=os_x
-endif
-
-ifneq ($(TEST_OPENCL), )
-TEST_CXX_FLAGS += -DTEST_OPENCL
-endif
-
-ifneq ($(TEST_METAL), )
-TEST_CXX_FLAGS += -DTEST_METAL
-endif
-
-ifneq ($(TEST_CUDA), )
-TEST_CXX_FLAGS += -DTEST_CUDA
-endif
-
-# Compiling the tutorials requires libpng
-LIBPNG_LIBS_DEFAULT = $(shell libpng-config --ldflags)
-LIBPNG_CXX_FLAGS ?= $(shell libpng-config --cflags)
-# Workaround for libpng-config pointing to 64-bit versions on linux even when we're building for 32-bit
-ifneq (,$(findstring -m32,$(CXX)))
-ifneq (,$(findstring x86_64,$(LIBPNG_LIBS_DEFAULT)))
-LIBPNG_LIBS ?= -lpng
-endif
-endif
-LIBPNG_LIBS ?= $(LIBPNG_LIBS_DEFAULT)
-
-# Workaround brew Cellar path for libpng-config output.
-LIBJPEG_LINKER_PATH ?= $(shell echo $(LIBPNG_LIBS_DEFAULT) | sed -e'/-L.*[/][Cc]ellar[/]libpng/!d;s=\(.*\)/[Cc]ellar/libpng/.*=\1/lib=')
-LIBJPEG_LIBS ?= $(LIBJPEG_LINKER_PATH) -ljpeg
-
-# There's no libjpeg-config, unfortunately. We should look for
-# jpeglib.h one directory level up from png.h . Also handle
-# Mac OS brew installs where libpng-config returns paths
-# into the PNG cellar.
-LIBPNG_INCLUDE_DIRS = $(filter -I%,$(LIBPNG_CXX_FLAGS))
-LIBJPEG_CXX_FLAGS ?= $(shell echo $(LIBPNG_INCLUDE_DIRS) | sed -e'/[Cc]ellar[/]libpng/!s=\(.*\)=\1/..=;s=\(.*\)/[Cc]ellar/libpng/.*=\1/include=')
-
-IMAGE_IO_LIBS = $(LIBPNG_LIBS) $(LIBJPEG_LIBS)
-IMAGE_IO_CXX_FLAGS = $(LIBPNG_CXX_FLAGS) $(LIBJPEG_CXX_FLAGS)
-
-# We're building into the current directory $(CURDIR). Find the Halide
-# repo root directory (the location of the makefile)
-THIS_MAKEFILE = $(realpath $(filter %Makefile, $(MAKEFILE_LIST)))
-ROOT_DIR = $(strip $(shell dirname $(THIS_MAKEFILE)))
-SRC_DIR  = $(ROOT_DIR)/src
-
-# Allow the user to specify PYBIND11_PATH as a relative path,
-# but canonicalize it to an absolute path since the sub-makefile
-# we call may have a different working dir.
-ifdef PYBIND11_PATH
-	REAL_PYBIND11_PATH = $(realpath $(PYBIND11_PATH))
-else
-	REAL_PYBIND11_PATH = /PYBIND11_PATH/is/undefined
-endif
-
-TARGET=$(if $(HL_TARGET),$(HL_TARGET),host)
-
-# The following directories are all relative to the output directory (i.e. $(CURDIR), not $(SRC_DIR))
-LIB_DIR     = lib
-BIN_DIR     = bin
-DISTRIB_DIR = distrib
-INCLUDE_DIR = include
-DOC_DIR     = doc
-BUILD_DIR   = $(BIN_DIR)/build
-FILTERS_DIR = $(BIN_DIR)/$(TARGET)/build
-TMP_DIR     = $(BUILD_DIR)/tmp
-HEXAGON_RUNTIME_LIBS_DIR = src/runtime/hexagon_remote/bin
-HEXAGON_RUNTIME_LIBS = \
-  $(HEXAGON_RUNTIME_LIBS_DIR)/arm-32-android/libhalide_hexagon_host.so \
-  $(HEXAGON_RUNTIME_LIBS_DIR)/arm-64-android/libhalide_hexagon_host.so \
-  $(HEXAGON_RUNTIME_LIBS_DIR)/host/libhalide_hexagon_host.so \
-  $(HEXAGON_RUNTIME_LIBS_DIR)/v60/hexagon_sim_remote \
-  $(HEXAGON_RUNTIME_LIBS_DIR)/v60/libhalide_hexagon_remote_skel.so \
-  $(HEXAGON_RUNTIME_LIBS_DIR)/v60/signed_by_debug/libhalide_hexagon_remote_skel.so
-
-SOURCE_FILES = \
-  AddImageChecks.cpp \
-  AddParameterChecks.cpp \
-  AlignLoads.cpp \
-  AllocationBoundsInference.cpp \
-  ApplySplit.cpp \
-  AssociativeOpsTable.cpp \
-  Associativity.cpp \
-  AutoSchedule.cpp \
-  AutoScheduleUtils.cpp \
-  BoundaryConditions.cpp \
-  Bounds.cpp \
-  BoundsInference.cpp \
-  BoundSmallAllocations.cpp \
-  Buffer.cpp \
-  Closure.cpp \
-  CodeGen_ARM.cpp \
-  CodeGen_C.cpp \
-  CodeGen_GPU_Dev.cpp \
-  CodeGen_GPU_Host.cpp \
-  CodeGen_Hexagon.cpp \
-  CodeGen_Internal.cpp \
-  CodeGen_LLVM.cpp \
-  CodeGen_MIPS.cpp \
-  CodeGen_OpenCL_Dev.cpp \
-  CodeGen_Metal_Dev.cpp \
-  CodeGen_OpenGL_Dev.cpp \
-  CodeGen_OpenGLCompute_Dev.cpp \
-  CodeGen_Posix.cpp \
-  CodeGen_PowerPC.cpp \
-  CodeGen_PTX_Dev.cpp \
-  CodeGen_X86.cpp \
-  CPlusPlusMangle.cpp \
-  CSE.cpp \
-  CanonicalizeGPUVars.cpp \
-  Debug.cpp \
-  DebugArguments.cpp \
-  DebugToFile.cpp \
-  Definition.cpp \
-  Deinterleave.cpp \
-  DeviceArgument.cpp \
-  DeviceInterface.cpp \
-  Dimension.cpp \
-  EarlyFree.cpp \
-  Elf.cpp \
-  EliminateBoolVectors.cpp \
-  Error.cpp \
-  FastIntegerDivide.cpp \
-  FindCalls.cpp \
-  Float16.cpp \
-  Func.cpp \
-  Function.cpp \
-  FuseGPUThreadLoops.cpp \
-  FuzzFloatStores.cpp \
-  Generator.cpp \
-  HexagonOffload.cpp \
-  HexagonOptimize.cpp \
-  ImageParam.cpp \
-  InferArguments.cpp \
-  InjectHostDevBufferCopies.cpp \
-  InjectOpenGLIntrinsics.cpp \
-  Inline.cpp \
-  InlineReductions.cpp \
-  IntegerDivisionTable.cpp \
-  Interval.cpp \
-  Introspection.cpp \
-  IR.cpp \
-  IREquality.cpp \
-  IRMatch.cpp \
-  IRMutator.cpp \
-  IROperator.cpp \
-  IRPrinter.cpp \
-  IRVisitor.cpp \
-  JITModule.cpp \
-  Lerp.cpp \
-  LICM.cpp \
-  LLVM_Output.cpp \
-  LLVM_Runtime_Linker.cpp \
-  LoopCarry.cpp \
-  Lower.cpp \
-  LowerWarpShuffles.cpp \
-  MatlabWrapper.cpp \
-  Memoization.cpp \
-  Module.cpp \
-  ModulusRemainder.cpp \
-  Monotonic.cpp \
-  ObjectInstanceRegistry.cpp \
-  OutputImageParam.cpp \
-  ParallelRVar.cpp \
-  ParamMap.cpp \
-  Parameter.cpp \
-  PartitionLoops.cpp \
-  Pipeline.cpp \
-  Prefetch.cpp \
-  PrintLoopNest.cpp \
-  Profiling.cpp \
-  PythonExtensionGen.cpp \
-  Qualify.cpp \
-  Random.cpp \
-  RDom.cpp \
-  RealizationOrder.cpp \
-  Reduction.cpp \
-  RegionCosts.cpp \
-  RemoveDeadAllocations.cpp \
-  RemoveTrivialForLoops.cpp \
-  RemoveUndef.cpp \
-  Schedule.cpp \
-  ScheduleFunctions.cpp \
-  SelectGPUAPI.cpp \
-  Simplify.cpp \
-  SimplifySpecializations.cpp \
-  SkipStages.cpp \
-  SlidingWindow.cpp \
-  Solve.cpp \
-  SplitTuples.cpp \
-  StmtToHtml.cpp \
-  StorageFlattening.cpp \
-  StorageFolding.cpp \
-  StrictifyFloat.cpp \
-  Substitute.cpp \
-  Target.cpp \
-  Tracing.cpp \
-  TrimNoOps.cpp \
-  Tuple.cpp \
-  Type.cpp \
-  UnifyDuplicateLets.cpp \
-  UniquifyVariableNames.cpp \
-  UnpackBuffers.cpp \
-  UnrollLoops.cpp \
-  Util.cpp \
-  Var.cpp \
-  VaryingAttributes.cpp \
-  VectorizeLoops.cpp \
-  WrapCalls.cpp \
-  WrapExternStages.cpp
-
-# The externally-visible header files that go into making Halide.h. Don't include anything here that includes llvm headers.
-HEADER_FILES = \
-  AddImageChecks.h \
-  AddParameterChecks.h \
-  AlignLoads.h \
-  AllocationBoundsInference.h \
-  ApplySplit.h \
-  Argument.h \
-  AssociativeOpsTable.h \
-  Associativity.h \
-  AutoSchedule.h \
-  AutoScheduleUtils.h \
-  BoundaryConditions.h \
-  Bounds.h \
-  BoundsInference.h \
-  BoundSmallAllocations.h \
-  Buffer.h \
-  Closure.h \
-  CodeGen_ARM.h \
-  CodeGen_C.h \
-  CodeGen_GPU_Dev.h \
-  CodeGen_GPU_Host.h \
-  CodeGen_Internal.h \
-  CodeGen_LLVM.h \
-  CodeGen_MIPS.h \
-  CodeGen_OpenCL_Dev.h \
-  CodeGen_Metal_Dev.h \
-  CodeGen_OpenGL_Dev.h \
-  CodeGen_OpenGLCompute_Dev.h \
-  CodeGen_Posix.h \
-  CodeGen_PowerPC.h \
-  CodeGen_PTX_Dev.h \
-  CodeGen_X86.h \
-  ConciseCasts.h \
-  CPlusPlusMangle.h \
-  CSE.h \
-  CanonicalizeGPUVars.h \
-  Debug.h \
-  DebugArguments.h \
-  DebugToFile.h \
-  Definition.h \
-  Deinterleave.h \
-  DeviceArgument.h \
-  DeviceInterface.h \
-  Dimension.h \
-  EarlyFree.h \
-  Elf.h \
-  EliminateBoolVectors.h \
-  Error.h \
-  Expr.h \
-  ExprUsesVar.h \
-  Extern.h \
-  FastIntegerDivide.h \
-  FindCalls.h \
-  Float16.h \
-  Func.h \
-  Function.h \
-  FunctionPtr.h \
-  FuseGPUThreadLoops.h \
-  FuzzFloatStores.h \
-  Generator.h \
-  HexagonOffload.h \
-  HexagonOptimize.h \
-  runtime/HalideRuntime.h \
-  runtime/HalideBuffer.h \
-  ImageParam.h \
-  InferArguments.h \
-  InjectHostDevBufferCopies.h \
-  InjectOpenGLIntrinsics.h \
-  Inline.h \
-  InlineReductions.h \
-  IntegerDivisionTable.h \
-  Interval.h \
-  Introspection.h \
-  IntrusivePtr.h \
-  IREquality.h \
-  IR.h \
-  IRMatch.h \
-  IRMutator.h \
-  IROperator.h \
-  IRPrinter.h \
-  IRVisitor.h \
-  JITModule.h \
-  Lambda.h \
-  Lerp.h \
-  LICM.h \
-  LLVM_Output.h \
-  LLVM_Runtime_Linker.h \
-  LoopCarry.h \
-  Lower.h \
-  LowerWarpShuffles.h \
-  MainPage.h \
-  MatlabWrapper.h \
-  Memoization.h \
-  Module.h \
-  ModulusRemainder.h \
-  Monotonic.h \
-  ObjectInstanceRegistry.h \
-  Outputs.h \
-  OutputImageParam.h \
-  ParallelRVar.h \
-  Param.h \
-  ParamMap.h \
-  Parameter.h \
-  PartitionLoops.h \
-  Pipeline.h \
-  Prefetch.h \
-  Profiling.h \
-  PythonExtensionGen.h \
-  Qualify.h \
-  Random.h \
-  RealizationOrder.h \
-  RDom.h \
-  Reduction.h \
-  RegionCosts.h \
-  RemoveDeadAllocations.h \
-  RemoveTrivialForLoops.h \
-  RemoveUndef.h \
-  Schedule.h \
-  ScheduleFunctions.h \
-  Scope.h \
-  SelectGPUAPI.h \
-  Simplify.h \
-  SimplifySpecializations.h \
-  SkipStages.h \
-  SlidingWindow.h \
-  Solve.h \
-  SplitTuples.h \
-  StmtToHtml.h \
-  StorageFlattening.h \
-  StorageFolding.h \
-  StrictifyFloat.h \
-  Substitute.h \
-  Target.h \
-  ThreadPool.h \
-  Tracing.h \
-  TrimNoOps.h \
-  Tuple.h \
-  Type.h \
-  UnifyDuplicateLets.h \
-  UniquifyVariableNames.h \
-  UnpackBuffers.h \
-  UnrollLoops.h \
-  Util.h \
-  Var.h \
-  VaryingAttributes.h \
-  VectorizeLoops.h \
-  WrapCalls.h \
-  WrapExternStages.h
-
-OBJECTS = $(SOURCE_FILES:%.cpp=$(BUILD_DIR)/%.o)
-HEADERS = $(HEADER_FILES:%.h=$(SRC_DIR)/%.h)
-
-RUNTIME_CPP_COMPONENTS = \
-  aarch64_cpu_features \
-  alignment_128 \
-  alignment_32 \
-  android_clock \
-  android_host_cpu_count \
-  android_io \
-  android_opengl_context \
-  android_tempfile \
-  arm_cpu_features \
-  buffer_t \
-  cache \
-  can_use_target \
-  cuda \
-  destructors \
-  device_interface \
-  errors \
-  fake_thread_pool \
-  float16_t \
-  gpu_device_selection \
-  hexagon_cpu_features \
-  hexagon_dma \
-  hexagon_host \
-  ios_io \
-  linux_clock \
-  linux_host_cpu_count \
-  linux_opengl_context \
-  linux_yield \
-  matlab \
-  metadata \
-  metal \
-  metal_objc_arm \
-  metal_objc_x86 \
-  mingw_math \
-  mips_cpu_features \
-  module_aot_ref_count \
-  module_jit_ref_count \
-  msan \
-  msan_stubs \
-  old_buffer_t \
-  opencl \
-  opengl \
-  openglcompute \
-  osx_clock \
-  osx_get_symbol \
-  osx_host_cpu_count \
-  osx_opengl_context \
-  osx_yield \
-  posix_allocator \
-  posix_clock \
-  posix_error_handler \
-  posix_get_symbol \
-  posix_io \
-  posix_print \
-  posix_tempfile \
-  posix_threads \
-  posix_threads_tsan \
-  powerpc_cpu_features \
-  prefetch \
-  profiler \
-  profiler_inlined \
-  qurt_allocator \
-  qurt_hvx \
-  qurt_init_fini \
-  qurt_threads \
-  qurt_threads_tsan \
-  qurt_yield \
-  runtime_api \
-  ssp \
-  to_string \
-  tracing \
-  windows_clock \
-  windows_cuda \
-  windows_get_symbol \
-  windows_io \
-  windows_opencl \
-  windows_profiler \
-  windows_tempfile \
-  windows_threads \
-  windows_threads_tsan \
-  windows_yield \
-  write_debug_image \
-  x86_cpu_features \
-  hexagon_cache_allocator \
-  default_cache_allocator
-
-RUNTIME_LL_COMPONENTS = \
-  aarch64 \
-  arm \
-  arm_no_neon \
-  hvx_64 \
-  hvx_128 \
-  mips \
-  posix_math \
-  powerpc \
-  ptx_dev \
-  win32_math \
-  x86 \
-  x86_avx \
-  x86_avx2 \
-  x86_sse41
-
-RUNTIME_EXPORTED_INCLUDES = $(INCLUDE_DIR)/HalideRuntime.h \
-                            $(INCLUDE_DIR)/HalideRuntimeCuda.h \
-                            $(INCLUDE_DIR)/HalideRuntimeHexagonDma.h \
-                            $(INCLUDE_DIR)/HalideRuntimeHexagonHost.h \
-                            $(INCLUDE_DIR)/HalideRuntimeOpenCL.h \
-                            $(INCLUDE_DIR)/HalideRuntimeOpenGL.h \
-                            $(INCLUDE_DIR)/HalideRuntimeOpenGLCompute.h \
-                            $(INCLUDE_DIR)/HalideRuntimeMetal.h	\
-                            $(INCLUDE_DIR)/HalideRuntimeQurt.h \
-                            $(INCLUDE_DIR)/HalideBuffer.h
-
-INITIAL_MODULES = $(RUNTIME_CPP_COMPONENTS:%=$(BUILD_DIR)/initmod.%_32.o) \
-                  $(RUNTIME_CPP_COMPONENTS:%=$(BUILD_DIR)/initmod.%_64.o) \
-                  $(RUNTIME_CPP_COMPONENTS:%=$(BUILD_DIR)/initmod.%_32_debug.o) \
-                  $(RUNTIME_CPP_COMPONENTS:%=$(BUILD_DIR)/initmod.%_64_debug.o) \
-                  $(RUNTIME_EXPORTED_INCLUDES:$(INCLUDE_DIR)/%.h=$(BUILD_DIR)/initmod.%_h.o) \
-                  $(BUILD_DIR)/initmod.inlined_c.o \
-                  $(RUNTIME_LL_COMPONENTS:%=$(BUILD_DIR)/initmod.%_ll.o) \
-                  $(PTX_DEVICE_INITIAL_MODULES:libdevice.%.bc=$(BUILD_DIR)/initmod_ptx.%_ll.o)
-
-# Add the Hexagon simulator to the rpath on Linux. (Not supported elsewhere, so no else cases.)
-ifeq ($(UNAME), Linux)
-ifneq (,$(WITH_HEXAGON))
-ifneq (,$(HL_HEXAGON_TOOLS))
-TEST_LD_FLAGS += -Wl,--rpath=$(ROOT_DIR)/src/runtime/hexagon_remote/bin/host
-TEST_LD_FLAGS += -Wl,--rpath=$(HL_HEXAGON_TOOLS)/lib/iss
-endif
-endif
-endif
-
-.PHONY: all
-all: $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(RUNTIME_EXPORTED_INCLUDES) test_internal
-
-$(BUILD_DIR)/llvm_objects/list: $(OBJECTS) $(INITIAL_MODULES)
-	# Determine the relevant object files from llvm with a dummy
-	# compilation. Passing -t to the linker gets it to list which
-	# object files in which archives it uses to resolve
-	# symbols. We only care about the libLLVM ones.
-	@mkdir -p $(@D)
-	$(CXX) -o /dev/null -shared $(OBJECTS) $(INITIAL_MODULES) -Wl,-t $(LLVM_STATIC_LIBS) $(LLVM_SYSTEM_LIBS) $(COMMON_LD_FLAGS) 2>&1| egrep "libLLVM" > $(BUILD_DIR)/llvm_objects/list.new
-	# if the list has changed since the previous build, or there
-	# is no list from a previous build, then delete any old object
-	# files and re-extract the required object files
-	cd $(BUILD_DIR)/llvm_objects; \
-	if cmp -s list.new list; \
-	then \
-	echo "No changes in LLVM deps"; \
-	touch list; \
-	else \
-	rm -f llvm_*.o*; \
-	cat list.new | sed = | sed "N;s/[()]/ /g;s/\n /\n/;s/\([0-9]*\)\n\([^ ]*\) \([^ ]*\)/ar x \2 \3; mv \3 llvm_\1_\3/" | bash -; \
-	mv list.new list; \
-	fi
-
-$(LIB_DIR)/libHalide.a: $(OBJECTS) $(INITIAL_MODULES) $(BUILD_DIR)/llvm_objects/list
-	# Archive together all the halide and llvm object files
-	@mkdir -p $(@D)
-	@rm -f $(LIB_DIR)/libHalide.a
-	# ar breaks on MinGW with all objects at the same time.
-	echo $(OBJECTS) $(INITIAL_MODULES) $(BUILD_DIR)/llvm_objects/llvm_*.o* | xargs -n200 ar q $(LIB_DIR)/libHalide.a
-	ranlib $(LIB_DIR)/libHalide.a
-
-$(BIN_DIR)/libHalide.$(SHARED_EXT): $(OBJECTS) $(INITIAL_MODULES)
-	@mkdir -p $(@D)
-	$(CXX) -shared $(OBJECTS) $(INITIAL_MODULES) $(LLVM_LIBS_FOR_SHARED_LIBHALIDE) $(LLVM_SYSTEM_LIBS) $(COMMON_LD_FLAGS) $(INSTALL_NAME_TOOL_LD_FLAGS) -o $(BIN_DIR)/libHalide.$(SHARED_EXT)
-ifeq ($(UNAME), Darwin)
-	install_name_tool -id $(CURDIR)/$(BIN_DIR)/libHalide.$(SHARED_EXT) $(BIN_DIR)/libHalide.$(SHARED_EXT)
-endif
-
-$(INCLUDE_DIR)/Halide.h: $(SRC_DIR)/../LICENSE.txt $(HEADERS) $(BIN_DIR)/build_halide_h
-	@mkdir -p $(@D)
-	$(BIN_DIR)/build_halide_h $(SRC_DIR)/../LICENSE.txt $(HEADERS) > $(INCLUDE_DIR)/Halide.h
-	# Also generate a precompiled version in the same folder so that anything compiled with a compatible set of flags can use it
-	$(CXX) -std=c++11 $(TEST_CXX_FLAGS) -I$(ROOT_DIR) $(OPTIMIZE) -x c++-header $(INCLUDE_DIR)/Halide.h -o $(INCLUDE_DIR)/Halide.h.gch
-
-$(INCLUDE_DIR)/HalideRuntime%: $(SRC_DIR)/runtime/HalideRuntime%
-	echo Copying $<
-	@mkdir -p $(@D)
-	cp $< $(INCLUDE_DIR)/
-
-$(INCLUDE_DIR)/HalideBuffer.h: $(SRC_DIR)/runtime/HalideBuffer.h
-	echo Copying $<
-	@mkdir -p $(@D)
-	cp $< $(INCLUDE_DIR)/
-
-$(BIN_DIR)/build_halide_h: $(ROOT_DIR)/tools/build_halide_h.cpp
-	@-mkdir -p $(@D)
-	$(CXX) -std=c++11 $< -o $@
-
--include $(OBJECTS:.o=.d)
--include $(INITIAL_MODULES:.o=.d)
-
-# Compile generic 32- or 64-bit code
-# (The 'nacl' is a red herring. This is just a generic 32-bit little-endian target.)
-RUNTIME_TRIPLE_32 = "le32-unknown-nacl-unknown"
-RUNTIME_TRIPLE_64 = "le64-unknown-unknown-unknown"
-
-# win32 is tied to x86 due to the use of the __stdcall calling convention
-RUNTIME_TRIPLE_WIN_32 = "i386-unknown-unknown-unknown"
-
-RUNTIME_CXX_FLAGS = -O3 -fno-vectorize -ffreestanding -fno-blocks -fno-exceptions -fno-unwind-tables -fpic
-$(BUILD_DIR)/initmod.%_64.ll: $(SRC_DIR)/runtime/%.cpp $(BUILD_DIR)/clang_ok
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) $(RUNTIME_CXX_FLAGS) -m64 -target $(RUNTIME_TRIPLE_64) -DCOMPILING_HALIDE_RUNTIME -DBITS_64 -emit-llvm -S $(SRC_DIR)/runtime/$*.cpp -o $@ -MMD -MP -MF $(BUILD_DIR)/initmod.$*_64.d
-
-$(BUILD_DIR)/initmod.windows_%_32.ll: $(SRC_DIR)/runtime/windows_%.cpp $(BUILD_DIR)/clang_ok
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) $(RUNTIME_CXX_FLAGS) -m32 -target $(RUNTIME_TRIPLE_WIN_32) -DCOMPILING_HALIDE_RUNTIME -DBITS_32 -emit-llvm -S $(SRC_DIR)/runtime/windows_$*.cpp -o $@ -MMD -MP -MF $(BUILD_DIR)/initmod.windows_$*_32.d
-
-$(BUILD_DIR)/initmod.%_32.ll: $(SRC_DIR)/runtime/%.cpp $(BUILD_DIR)/clang_ok
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) $(RUNTIME_CXX_FLAGS) -m32 -target $(RUNTIME_TRIPLE_32) -DCOMPILING_HALIDE_RUNTIME -DBITS_32 -emit-llvm -S $(SRC_DIR)/runtime/$*.cpp -o $@ -MMD -MP -MF $(BUILD_DIR)/initmod.$*_32.d
-
-$(BUILD_DIR)/initmod.%_64_debug.ll: $(SRC_DIR)/runtime/%.cpp $(BUILD_DIR)/clang_ok
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) -g -DDEBUG_RUNTIME $(RUNTIME_CXX_FLAGS) -m64 -target  $(RUNTIME_TRIPLE_64) -DCOMPILING_HALIDE_RUNTIME -DBITS_64 -emit-llvm -S $(SRC_DIR)/runtime/$*.cpp -o $@ -MMD -MP -MF $(BUILD_DIR)/initmod.$*_64_debug.d
-
-$(BUILD_DIR)/initmod.windows_%_32_debug.ll: $(SRC_DIR)/runtime/windows_%.cpp $(BUILD_DIR)/clang_ok
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) -g -DDEBUG_RUNTIME $(RUNTIME_CXX_FLAGS) -m32 -target $(RUNTIME_TRIPLE_WIN_32) -DCOMPILING_HALIDE_RUNTIME -DBITS_32 -emit-llvm -S $(SRC_DIR)/runtime/windows_$*.cpp -o $@ -MMD -MP -MF $(BUILD_DIR)/initmod.windows_$*_32_debug.d
-
-$(BUILD_DIR)/initmod.%_32_debug.ll: $(SRC_DIR)/runtime/%.cpp $(BUILD_DIR)/clang_ok
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) -g -DDEBUG_RUNTIME -O3 $(RUNTIME_CXX_FLAGS) -m32 -target $(RUNTIME_TRIPLE_32) -DCOMPILING_HALIDE_RUNTIME -DBITS_32 -emit-llvm -S $(SRC_DIR)/runtime/$*.cpp -o $@ -MMD -MP -MF $(BUILD_DIR)/initmod.$*_32_debug.d
-
-$(BUILD_DIR)/initmod.%_ll.ll: $(SRC_DIR)/runtime/%.ll
-	@mkdir -p $(@D)
-	cp $(SRC_DIR)/runtime/$*.ll $(BUILD_DIR)/initmod.$*_ll.ll
-
-$(BUILD_DIR)/initmod.%.bc: $(BUILD_DIR)/initmod.%.ll $(BUILD_DIR)/llvm_ok
-	$(LLVM_AS) $(BUILD_DIR)/initmod.$*.ll -o $(BUILD_DIR)/initmod.$*.bc
-
-$(BUILD_DIR)/initmod.%.cpp: $(BIN_DIR)/binary2cpp $(BUILD_DIR)/initmod.%.bc
-	./$(BIN_DIR)/binary2cpp halide_internal_initmod_$* < $(BUILD_DIR)/initmod.$*.bc > $@
-
-$(BUILD_DIR)/initmod.%_h.cpp: $(BIN_DIR)/binary2cpp $(SRC_DIR)/runtime/%.h
-	./$(BIN_DIR)/binary2cpp halide_internal_runtime_header_$*_h < $(SRC_DIR)/runtime/$*.h > $@
-
-# Any c in the runtime that must be inlined needs to be copy-pasted into the output for the C backend.
-$(BUILD_DIR)/initmod.inlined_c.cpp: $(BIN_DIR)/binary2cpp $(SRC_DIR)/runtime/buffer_t.cpp
-	./$(BIN_DIR)/binary2cpp halide_internal_initmod_inlined_c < $(SRC_DIR)/runtime/buffer_t.cpp > $@
-
-$(BUILD_DIR)/initmod_ptx.%_ll.cpp: $(BIN_DIR)/binary2cpp $(SRC_DIR)/runtime/nvidia_libdevice_bitcode/libdevice.%.bc
-	./$(BIN_DIR)/binary2cpp halide_internal_initmod_ptx_$(basename $*)_ll < $(SRC_DIR)/runtime/nvidia_libdevice_bitcode/libdevice.$*.bc > $@
-
-$(BIN_DIR)/binary2cpp: $(ROOT_DIR)/tools/binary2cpp.cpp
-	@mkdir -p $(@D)
-	$(CXX) $< -o $@
-
-$(BUILD_DIR)/initmod_ptx.%_ll.o: $(BUILD_DIR)/initmod_ptx.%_ll.cpp
-	$(CXX) -c $< -o $@ -MMD -MP -MF $(BUILD_DIR)/$*.d -MT $(BUILD_DIR)/$*.o
-
-$(BUILD_DIR)/initmod.%.o: $(BUILD_DIR)/initmod.%.cpp
-	$(CXX) -c $< -o $@ -MMD -MP -MF $(BUILD_DIR)/$*.d -MT $(BUILD_DIR)/$*.o
-
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp $(SRC_DIR)/%.h $(BUILD_DIR)/llvm_ok
-	@mkdir -p $(@D)
-	$(CXX) $(CXX_FLAGS) -c $< -o $@ -MMD -MP -MF $(BUILD_DIR)/$*.d -MT $(BUILD_DIR)/$*.o
-
-.PHONY: clean
-clean:
-	rm -rf $(LIB_DIR)
-	rm -rf $(BIN_DIR)
-	rm -rf $(BUILD_DIR)
-	rm -rf $(TMP_DIR)
-	rm -rf $(FILTERS_DIR)
-	rm -rf $(INCLUDE_DIR)
-	rm -rf $(DOC_DIR)
-	rm -rf $(DISTRIB_DIR)
-
-.SECONDARY:
-
-CORRECTNESS_TESTS = $(shell ls $(ROOT_DIR)/test/correctness/*.cpp) $(shell ls $(ROOT_DIR)/test/correctness/*.c)
-PERFORMANCE_TESTS = $(shell ls $(ROOT_DIR)/test/performance/*.cpp)
-ERROR_TESTS = $(shell ls $(ROOT_DIR)/test/error/*.cpp)
-WARNING_TESTS = $(shell ls $(ROOT_DIR)/test/warning/*.cpp)
-OPENGL_TESTS := $(shell ls $(ROOT_DIR)/test/opengl/*.cpp)
-GENERATOR_EXTERNAL_TESTS := $(shell ls $(ROOT_DIR)/test/generator/*test.cpp)
-GENERATOR_EXTERNAL_TEST_GENERATOR := $(shell ls $(ROOT_DIR)/test/generator/*_generator.cpp)
-TUTORIALS = $(filter-out %_generate.cpp, $(shell ls $(ROOT_DIR)/tutorial/*.cpp))
-AUTO_SCHEDULE_TESTS = $(shell ls $(ROOT_DIR)/test/auto_schedule/*.cpp)
-
--include $(OPENGL_TESTS:$(ROOT_DIR)/test/opengl/%.cpp=$(BUILD_DIR)/test_opengl_%.d)
-
-test_correctness: $(CORRECTNESS_TESTS:$(ROOT_DIR)/test/correctness/%.cpp=correctness_%) $(CORRECTNESS_TESTS:$(ROOT_DIR)/test/correctness/%.c=correctness_%)
-test_performance: $(PERFORMANCE_TESTS:$(ROOT_DIR)/test/performance/%.cpp=performance_%)
-test_error: $(ERROR_TESTS:$(ROOT_DIR)/test/error/%.cpp=error_%)
-test_warning: $(WARNING_TESTS:$(ROOT_DIR)/test/warning/%.cpp=warning_%)
-test_tutorial: $(TUTORIALS:$(ROOT_DIR)/tutorial/%.cpp=tutorial_%)
-test_valgrind: $(CORRECTNESS_TESTS:$(ROOT_DIR)/test/correctness/%.cpp=valgrind_%)
-test_avx512: $(CORRECTNESS_TESTS:$(ROOT_DIR)/test/correctness/%.cpp=avx512_%)
-test_opengl: $(OPENGL_TESTS:$(ROOT_DIR)/test/opengl/%.cpp=opengl_%)
-test_auto_schedule: $(AUTO_SCHEDULE_TESTS:$(ROOT_DIR)/test/auto_schedule/%.cpp=auto_schedule_%)
-
-# There are three types of tests for generators:
-# 1) Externally-written aot-based tests
-# 1) Externally-written aot-based tests (compiled using C++ backend)
-# 2) Externally-written JIT-based tests
-GENERATOR_AOT_TESTS = $(GENERATOR_EXTERNAL_TESTS:$(ROOT_DIR)/test/generator/%_aottest.cpp=generator_aot_%)
-GENERATOR_AOTCPP_TESTS = $(GENERATOR_EXTERNAL_TESTS:$(ROOT_DIR)/test/generator/%_aottest.cpp=generator_aotcpp_%)
-GENERATOR_JIT_TESTS = $(GENERATOR_EXTERNAL_TESTS:$(ROOT_DIR)/test/generator/%_jittest.cpp=generator_jit_%)
-
-# multitarget test doesn't make any sense for the CPP backend; just skip it.
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_multitarget,$(GENERATOR_AOTCPP_TESTS))
-
-# Note that many of the AOT-CPP tests are broken right now;
-# remove AOT-CPP tests that don't (yet) work for C++ backend
-# (each tagged with the *known* blocking issue(s))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled)
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_acquire_release,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled)
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_define_extern_opencl,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled)
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_gpu_object_lifetime,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled)
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_gpu_only,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled))
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_cleanup_on_error,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled)
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_old_buffer_t,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2084 (only if opencl enabled)
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_buffer_copy,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2071
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_user_context,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2071
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_argvcall,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2071
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_metadata_tester,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2071
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_cxx_mangling,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2075
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_msan,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2075
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_memory_profiler_mandelbrot,$(GENERATOR_AOTCPP_TESTS))
-
-# https://github.com/halide/Halide/issues/2082
-GENERATOR_AOTCPP_TESTS := $(filter-out generator_aotcpp_matlab,$(GENERATOR_AOTCPP_TESTS))
-
-test_aotcpp_generator: $(GENERATOR_AOTCPP_TESTS)
-
-# This is just a test to ensure than RunGen builds and links for a critical mass of Generators;
-# not all will work directly (e.g. due to missing define_externs at link time), so we blacklist
-# those known to be broken for plausible reasons.
-GENERATOR_BUILD_RUNGEN_TESTS = $(GENERATOR_EXTERNAL_TEST_GENERATOR:$(ROOT_DIR)/test/generator/%_generator.cpp=$(FILTERS_DIR)/%.rungen)
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/cxx_mangling_define_extern.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/define_extern_opencl.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/matlab.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/msan.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/multitarget.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/nested_externs.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/old_buffer_t.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-GENERATOR_BUILD_RUNGEN_TESTS := $(filter-out $(FILTERS_DIR)/tiled_blur.rungen,$(GENERATOR_BUILD_RUNGEN_TESTS))
-test_rungen: $(GENERATOR_BUILD_RUNGEN_TESTS)
-
-test_generator: $(GENERATOR_AOT_TESTS) $(GENERATOR_AOTCPP_TESTS) $(GENERATOR_JIT_TESTS) $(GENERATOR_BUILD_RUNGEN_TESTS)
-
-ALL_TESTS = test_internal test_correctness test_error test_tutorial test_warning test_generator
-
-# These targets perform timings of each test. For most tests this includes Halide JIT compile times, and run times.
-# For generator tests they time the compile time only. The times are recorded in CSV files.
-time_compilation_correctness: init_time_compilation_correctness $(CORRECTNESS_TESTS:$(ROOT_DIR)/test/correctness/%.cpp=time_compilation_test_%)
-time_compilation_performance: init_time_compilation_performance $(PERFORMANCE_TESTS:$(ROOT_DIR)/test/performance/%.cpp=time_compilation_performance_%)
-time_compilation_opengl: init_time_compilation_opengl $(OPENGL_TESTS:$(ROOT_DIR)/test/opengl/%.cpp=time_compilation_opengl_%)
-time_compilation_generator: init_time_compilation_generator $(GENERATOR_TESTS:$(ROOT_DIR)/test/generator/%_aottest.cpp=time_compilation_generator_%)
-
-init_time_compilation_%:
-	echo "TEST,User (s),System (s),Real" > $(@:init_time_compilation_%=compile_times_%.csv)
-
-TIME_COMPILATION ?= /usr/bin/time -a -f "$@,%U,%S,%E" -o
-
-run_tests: $(ALL_TESTS)
-	make -f $(THIS_MAKEFILE) test_performance test_auto_schedule
-
-build_tests: $(CORRECTNESS_TESTS:$(ROOT_DIR)/test/correctness/%.cpp=$(BIN_DIR)/correctness_%) \
-	$(PERFORMANCE_TESTS:$(ROOT_DIR)/test/performance/%.cpp=$(BIN_DIR)/performance_%) \
-	$(ERROR_TESTS:$(ROOT_DIR)/test/error/%.cpp=$(BIN_DIR)/error_%) \
-	$(WARNING_TESTS:$(ROOT_DIR)/test/warning/%.cpp=$(BIN_DIR)/warning_%) \
-	$(OPENGL_TESTS:$(ROOT_DIR)/test/opengl/%.cpp=$(BIN_DIR)/opengl_%) \
-	$(GENERATOR_EXTERNAL_TESTS:$(ROOT_DIR)/test/generator/%_aottest.cpp=$(BIN_DIR)/$(TARGET)/generator_aot_%) \
-	$(GENERATOR_EXTERNAL_TESTS:$(ROOT_DIR)/test/generator/%_jittest.cpp=$(BIN_DIR)/generator_jit_%) \
-	$(AUTO_SCHEDULE_TESTS:$(ROOT_DIR)/test/auto_schedule/%.cpp=$(BIN_DIR)/auto_schedule_%)
-
-clean_generator:
-	rm -rf $(BIN_DIR)/*.generator
-	rm -rf $(BIN_DIR)/*/runtime.a
-	rm -rf $(FILTERS_DIR)
-	rm -rf $(BIN_DIR)/*/generator_*
-	rm -rf $(BUILD_DIR)/*_generator.o
-	rm -f $(BUILD_DIR)/GenGen.o
-	rm -f $(BUILD_DIR)/RunGen.o
-
-time_compilation_tests: time_compilation_correctness time_compilation_performance time_compilation_generator
-
-LIBHALIDE_DEPS ?= $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h
-
-$(BUILD_DIR)/GenGen.o: $(ROOT_DIR)/tools/GenGen.cpp $(INCLUDE_DIR)/Halide.h
-	@mkdir -p $(@D)
-	$(CXX) -c $< $(TEST_CXX_FLAGS) -I$(INCLUDE_DIR) -o $@
-
-# Make an empty generator for generating runtimes.
-$(BIN_DIR)/runtime.generator: $(BUILD_DIR)/GenGen.o $(BIN_DIR)/libHalide.$(SHARED_EXT)
-	@mkdir -p $(@D)
-	$(CXX) $< $(TEST_LD_FLAGS) -o $@
-
-# Generate a standalone runtime for a given target string
-$(BIN_DIR)/%/runtime.a: $(BIN_DIR)/runtime.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -r runtime -o $(CURDIR)/$(BIN_DIR)/$* target=$*
-
-$(BIN_DIR)/test_internal: $(ROOT_DIR)/test/internal.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT)
-	@mkdir -p $(@D)
-	$(CXX) $(TEST_CXX_FLAGS) $< -I$(SRC_DIR) $(TEST_LD_FLAGS) -o $@
-
-# Correctness test that link against libHalide
-$(BIN_DIR)/correctness_%: $(ROOT_DIR)/test/correctness/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(RUNTIME_EXPORTED_INCLUDES)
-	@mkdir -p $(@D)
-	$(CXX) $(TEST_CXX_FLAGS) -I$(ROOT_DIR) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) $(TEST_LD_FLAGS) -o $@
-
-# Correctness tests that do NOT link against libHalide
-$(BIN_DIR)/correctness_plain_c_includes: $(ROOT_DIR)/test/correctness/plain_c_includes.c $(RUNTIME_EXPORTED_INCLUDES)
-	$(CXX) -x c -Wall -Werror -I$(ROOT_DIR) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(ROOT_DIR)/src/runtime -o $@
-
-# Note that this test must *not* link in either libHalide, or a Halide runtime;
-# this test should be usable without either.
-$(BIN_DIR)/correctness_halide_buffer: $(ROOT_DIR)/test/correctness/halide_buffer.cpp $(INCLUDE_DIR)/HalideBuffer.h $(RUNTIME_EXPORTED_INCLUDES)
-	$(CXX) $(TEST_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) -o $@
-
-# The image_io test additionally needs to link to libpng and
-# libjpeg.
-$(BIN_DIR)/correctness_image_io: $(ROOT_DIR)/test/correctness/image_io.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(RUNTIME_EXPORTED_INCLUDES)
-	$(CXX) $(TEST_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) -I$(ROOT_DIR) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) $(TEST_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-
-$(BIN_DIR)/performance_%: $(ROOT_DIR)/test/performance/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h
-	$(CXX) $(TEST_CXX_FLAGS) $(OPTIMIZE) $< -I$(INCLUDE_DIR) -I$(ROOT_DIR) $(TEST_LD_FLAGS) -o $@
-
-# Error tests that link against libHalide
-$(BIN_DIR)/error_%: $(ROOT_DIR)/test/error/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h
-	$(CXX) $(TEST_CXX_FLAGS) -I$(ROOT_DIR) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) $(TEST_LD_FLAGS) -o $@
-
-$(BIN_DIR)/warning_%: $(ROOT_DIR)/test/warning/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h
-	$(CXX) $(TEST_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) $(TEST_LD_FLAGS) -o $@
-
-$(BIN_DIR)/opengl_%: $(ROOT_DIR)/test/opengl/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(INCLUDE_DIR)/HalideRuntime.h $(INCLUDE_DIR)/HalideRuntimeOpenGL.h
-	$(CXX) $(TEST_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) -I$(SRC_DIR) $(TEST_LD_FLAGS) $(OPENGL_LD_FLAGS) -o $@ -MMD -MF $(BUILD_DIR)/test_opengl_$*.d
-
-# Auto schedule tests that link against libHalide
-$(BIN_DIR)/auto_schedule_%: $(ROOT_DIR)/test/auto_schedule/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h
-	$(CXX) $(TEST_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< -I$(INCLUDE_DIR) $(TEST_LD_FLAGS) -o $@
-
-# TODO(srj): this doesn't auto-delete, why not?
-.INTERMEDIATE: $(BIN_DIR)/%.generator
-
-# By default, %.generator is produced by building %_generator.cpp
-# Note that the rule includes all _generator.cpp files, so that generator with define_extern
-# usage can just add deps later.
-$(BUILD_DIR)/%_generator.o: $(ROOT_DIR)/test/generator/%_generator.cpp $(INCLUDE_DIR)/Halide.h
-	@mkdir -p $(@D)
-	$(CXX) $(TEST_CXX_FLAGS) -I$(INCLUDE_DIR) -I$(CURDIR)/$(FILTERS_DIR) -c $< -o $@
-
-$(BIN_DIR)/%.generator: $(BUILD_DIR)/GenGen.o $(BIN_DIR)/libHalide.$(SHARED_EXT) $(BUILD_DIR)/%_generator.o
-	@mkdir -p $(@D)
-	$(CXX) $(filter %.cpp %.o %.a,$^) $(TEST_LD_FLAGS) -o $@
-
-# It is not always possible to cross compile between 32-bit and 64-bit via the clang build as part of llvm
-# These next two rules can fail the compilationa nd produce zero length bitcode blobs.
-# If the zero length blob is actually used, the test will fail anyway, but usually only the bitness
-# of the target is used.
-$(BUILD_DIR)/external_code_extern_bitcode_32.cpp : $(ROOT_DIR)/test/generator/external_code_extern.cpp $(BIN_DIR)/binary2cpp
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) -O3 -c -m32 -target $(RUNTIME_TRIPLE_32) -emit-llvm $< -o $(BUILD_DIR)/external_code_extern_32.bc || echo -n > $(BUILD_DIR)/external_code_extern_32.bc
-	./$(BIN_DIR)/binary2cpp external_code_extern_bitcode_32 < $(BUILD_DIR)/external_code_extern_32.bc > $@
-
-$(BUILD_DIR)/external_code_extern_bitcode_64.cpp : $(ROOT_DIR)/test/generator/external_code_extern.cpp $(BIN_DIR)/binary2cpp
-	@mkdir -p $(@D)
-	$(CLANG) $(CXX_WARNING_FLAGS) -O3 -c -m64 -target $(RUNTIME_TRIPLE_64) -emit-llvm $< -o $(BUILD_DIR)/external_code_extern_64.bc || echo -n > $(BUILD_DIR)/external_code_extern_64.bc
-	./$(BIN_DIR)/binary2cpp external_code_extern_bitcode_64 < $(BUILD_DIR)/external_code_extern_64.bc > $@
-
-$(BUILD_DIR)/external_code_extern_cpp_source.cpp : $(ROOT_DIR)/test/generator/external_code_extern.cpp $(BIN_DIR)/binary2cpp
-	@mkdir -p $(@D)
-	./$(BIN_DIR)/binary2cpp external_code_extern_cpp_source < $(ROOT_DIR)/test/generator/external_code_extern.cpp > $@
-
-$(BIN_DIR)/external_code.generator: $(BUILD_DIR)/GenGen.o $(BIN_DIR)/libHalide.$(SHARED_EXT) $(BUILD_DIR)/external_code_generator.o $(BUILD_DIR)/external_code_extern_bitcode_32.cpp $(BUILD_DIR)/external_code_extern_bitcode_64.cpp $(BUILD_DIR)/external_code_extern_cpp_source.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(filter %.cpp %.o %.a,$^) $(TEST_LD_FLAGS) -o $@
-
-NAME_MANGLING_TARGET=$(NON_EMPTY_TARGET)-c_plus_plus_name_mangling
-
-GEN_AOT_OUTPUTS=-e static_library,h,cpp
-
-# By default, %.a/.h are produced by executing %.generator. Runtimes are not included in these.
-# (We explicitly also generate .cpp output here as well, as additional test surface for the C++ backend.)
-$(FILTERS_DIR)/%.a: $(BIN_DIR)/%.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g $* $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime
-
-$(FILTERS_DIR)/%.h: $(FILTERS_DIR)/%.a
-	@echo $@ produced implicitly by $^
-
-$(FILTERS_DIR)/%.cpp: $(FILTERS_DIR)/%.a
-	@echo $@ produced implicitly by $^
-
-$(FILTERS_DIR)/%.stub.h: $(BIN_DIR)/%.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g $* -n $* -o $(CURDIR)/$(FILTERS_DIR) -e cpp_stub
-
-$(FILTERS_DIR)/cxx_mangling_externs.o: $(ROOT_DIR)/test/generator/cxx_mangling_externs.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) -c $(filter-out %.h,$^) $(GEN_AOT_INCLUDES) -o $@
-
-# If we want to use a Generator with custom GeneratorParams, we need to write
-# custom rules: to pass the GeneratorParams, and to give a unique function and file name.
-$(FILTERS_DIR)/cxx_mangling.a: $(BIN_DIR)/cxx_mangling.generator $(FILTERS_DIR)/cxx_mangling_externs.o
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g cxx_mangling $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-c_plus_plus_name_mangling -f "HalideTest::AnotherNamespace::cxx_mangling"
-	$(ROOT_DIR)/tools/makelib.sh $@ $@ $(FILTERS_DIR)/cxx_mangling_externs.o
-
-ifneq ($(TEST_CUDA), )
-# Also build with a gpu target to ensure that the GPU-Host generation
-# code handles name mangling properly. (Note that we don't need to
-# run this code, just check for link errors.)
-$(FILTERS_DIR)/cxx_mangling_gpu.a: $(BIN_DIR)/cxx_mangling.generator $(FILTERS_DIR)/cxx_mangling_externs.o
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g cxx_mangling $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-c_plus_plus_name_mangling-cuda -f "HalideTest::cxx_mangling_gpu"
-	$(ROOT_DIR)/tools/makelib.sh $@ $@ $(FILTERS_DIR)/cxx_mangling_externs.o
-endif
-
-$(FILTERS_DIR)/cxx_mangling_define_extern_externs.o: $(ROOT_DIR)/test/generator/cxx_mangling_define_extern_externs.cpp $(FILTERS_DIR)/cxx_mangling.h
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) -c $(filter-out %.h,$^) $(GEN_AOT_INCLUDES) -o $@
-
-$(FILTERS_DIR)/cxx_mangling_define_extern.a: $(BIN_DIR)/cxx_mangling_define_extern.generator $(FILTERS_DIR)/cxx_mangling_define_extern_externs.o
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g cxx_mangling_define_extern $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-c_plus_plus_name_mangling-user_context -f "HalideTest::cxx_mangling_define_extern"
-	$(ROOT_DIR)/tools/makelib.sh $@ $@  $(FILTERS_DIR)/cxx_mangling_define_extern_externs.o
-
-# This tests the specific features gated by the legacy_buffer_wrappers flag, thus
-# we need to enable it for this Generator.
-$(FILTERS_DIR)/old_buffer_t.a: $(BIN_DIR)/old_buffer_t.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g old_buffer_t -f old_buffer_t $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-legacy_buffer_wrappers
-
-# pyramid needs a custom arg.
-$(FILTERS_DIR)/pyramid.a: $(BIN_DIR)/pyramid.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g pyramid -f pyramid $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime levels=10
-
-# memory_profiler_mandelbrot need profiler set
-$(FILTERS_DIR)/memory_profiler_mandelbrot.a: $(BIN_DIR)/memory_profiler_mandelbrot.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g memory_profiler_mandelbrot -f memory_profiler_mandelbrot $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-profile
-
-$(FILTERS_DIR)/alias_with_offset_42.a: $(BIN_DIR)/alias.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g alias_with_offset_42 -f alias_with_offset_42 $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime
-
-METADATA_TESTER_GENERATOR_ARGS=\
-	input.type=uint8 input.dim=3 \
-	dim_only_input_buffer.type=uint8 \
-	untyped_input_buffer.type=uint8 untyped_input_buffer.dim=3 \
-	output.type=float32,float32 output.dim=3 \
-	input_not_nod.type=uint8 input_not_nod.dim=3 \
-	input_nod.dim=3 \
-	input_not.type=uint8 \
-	array_input.size=2 \
-	array_i8.size=2 \
-	array_i16.size=2 \
-	array_i32.size=2 \
-	array_h.size=2 \
-	buffer_array_input2.dim=3 \
-	buffer_array_input3.type=float32 \
-	buffer_array_input4.dim=3 \
-	buffer_array_input4.type=float32 \
-	buffer_array_input5.size=2 \
-	buffer_array_input6.size=2 \
-	buffer_array_input6.dim=3 \
-	buffer_array_input7.size=2 \
-	buffer_array_input7.type=float32 \
-	buffer_array_input8.size=2 \
-	buffer_array_input8.dim=3 \
-	buffer_array_input8.type=float32 \
-	array_outputs.size=2 \
-	array_outputs7.size=2 \
-	array_outputs8.size=2 \
-	array_outputs9.size=2
-
-# metadata_tester is built with and without user-context
-$(FILTERS_DIR)/metadata_tester.a: $(BIN_DIR)/metadata_tester.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g metadata_tester -f metadata_tester $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime $(METADATA_TESTER_GENERATOR_ARGS)
-
-$(FILTERS_DIR)/metadata_tester_ucon.a: $(BIN_DIR)/metadata_tester.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g metadata_tester -f metadata_tester_ucon $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-user_context-no_runtime $(METADATA_TESTER_GENERATOR_ARGS)
-
-$(BIN_DIR)/$(TARGET)/generator_aot_metadata_tester: $(FILTERS_DIR)/metadata_tester_ucon.a
-
-$(FILTERS_DIR)/multitarget.a: $(BIN_DIR)/multitarget.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g multitarget -f "HalideTest::multitarget" $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-debug-no_runtime-c_plus_plus_name_mangling,$(TARGET)-no_runtime-c_plus_plus_name_mangling  -e assembly,bitcode,cpp,h,html,static_library,stmt
-
-$(FILTERS_DIR)/msan.a: $(BIN_DIR)/msan.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g msan -f msan $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-msan
-
-# user_context needs to be generated with user_context as the first argument to its calls
-$(FILTERS_DIR)/user_context.a: $(BIN_DIR)/user_context.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g user_context $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-user_context
-
-# ditto for user_context_insanity
-$(FILTERS_DIR)/user_context_insanity.a: $(BIN_DIR)/user_context_insanity.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g user_context_insanity $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-user_context
-
-# matlab needs to be generated with matlab in TARGET
-$(FILTERS_DIR)/matlab.a: $(BIN_DIR)/matlab.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g matlab $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime-matlab
-
-# Some .generators have additional dependencies (usually due to define_extern usage).
-# These typically require two extra dependencies:
-# (1) Ensuring the extra _generator.cpp is built into the .generator.
-# (2) Ensuring the extra .a is linked into the final output.
-
-# TODO(srj): we really want to say "anything that depends on tiled_blur.a also depends on blur2x2.a";
-# is there a way to specify that in Make?
-$(BIN_DIR)/$(TARGET)/generator_aot_tiled_blur: $(FILTERS_DIR)/blur2x2.a
-ifneq ($(TEST_CUDA), )
-$(BIN_DIR)/$(TARGET)/generator_aot_cxx_mangling: $(FILTERS_DIR)/cxx_mangling_gpu.a
-endif
-$(BIN_DIR)/$(TARGET)/generator_aot_cxx_mangling_define_extern: $(FILTERS_DIR)/cxx_mangling.a
-
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_tiled_blur: $(FILTERS_DIR)/blur2x2.cpp
-ifneq ($(TEST_CUDA), )
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_cxx_mangling: $(FILTERS_DIR)/cxx_mangling_gpu.cpp
-endif
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_cxx_mangling: $(FILTERS_DIR)/cxx_mangling_externs.o
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_cxx_mangling_define_extern: $(FILTERS_DIR)/cxx_mangling.cpp $(FILTERS_DIR)/cxx_mangling_externs.o $(FILTERS_DIR)/cxx_mangling_define_extern_externs.o
-
-$(BUILD_DIR)/stubuser_generator.o: $(FILTERS_DIR)/stubtest.stub.h
-$(BIN_DIR)/stubuser.generator: $(BUILD_DIR)/stubtest_generator.o
-
-# stubtest has input and output funcs with undefined types and array sizes; this is fine for stub
-# usage (the types can be inferred), but for AOT compilation, we must make the types
-# concrete via generator args.
-STUBTEST_GENERATOR_ARGS=\
-    untyped_buffer_input.type=uint8 untyped_buffer_input.dim=3 \
-	simple_input.type=float32 \
-	array_input.type=float32 array_input.size=2 \
-	int_arg.size=2 \
-	tuple_output.type=float32,float32 \
-	vectorize=true
-
-$(FILTERS_DIR)/stubtest.a: $(BIN_DIR)/stubtest.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g stubtest -f stubtest $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime $(STUBTEST_GENERATOR_ARGS)
-
-$(FILTERS_DIR)/external_code.a: $(BIN_DIR)/external_code.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g external_code -e static_library,h -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime external_code_is_bitcode=true
-
-$(FILTERS_DIR)/external_code.cpp: $(BIN_DIR)/external_code.generator
-	@mkdir -p $(@D)
-	$(CURDIR)/$< -g external_code -e cpp -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime external_code_is_bitcode=false
-
-# Usually, it's considered best practice to have one Generator per
-# .cpp file, with the generator-name and filename matching;
-# nested_externs_generators.cpp is a counterexample, and thus requires
-# some special casing to get right.  First, make a special rule to
-# build each of the Generators in nested_externs_generator.cpp (which
-# all have the form nested_externs_*).
-$(FILTERS_DIR)/nested_externs_%.a: $(BIN_DIR)/nested_externs.generator
-	$(CURDIR)/$< -g nested_externs_$* $(GEN_AOT_OUTPUTS) -o $(CURDIR)/$(FILTERS_DIR) target=$(TARGET)-no_runtime
-
-GEN_AOT_CXX_FLAGS=$(TEST_CXX_FLAGS) -Wno-unknown-pragmas
-GEN_AOT_INCLUDES=-I$(INCLUDE_DIR) -I$(FILTERS_DIR) -I$(ROOT_DIR) -I $(ROOT_DIR)/apps/support -I $(SRC_DIR)/runtime -I$(ROOT_DIR)/tools
-GEN_AOT_LD_FLAGS=$(COMMON_LD_FLAGS)
-
-ifneq ($(TEST_METAL), )
-# Unlike cuda and opencl, which dynamically go find the appropriate symbols, metal requires actual linking.
-GEN_AOT_LD_FLAGS+=$(METAL_LD_FLAGS)
-endif
-
-# By default, %_aottest.cpp depends on $(FILTERS_DIR)/%.a/.h (but not libHalide).
-$(BIN_DIR)/$(TARGET)/generator_aot_%: $(ROOT_DIR)/test/generator/%_aottest.cpp $(FILTERS_DIR)/%.a $(FILTERS_DIR)/%.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-# Also make AOT testing targets that depends on the .cpp output (rather than .a).
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_%: $(ROOT_DIR)/test/generator/%_aottest.cpp $(FILTERS_DIR)/%.cpp $(FILTERS_DIR)/%.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-# MSAN test doesn't use the standard runtime
-$(BIN_DIR)/$(TARGET)/generator_aot_msan: $(ROOT_DIR)/test/generator/msan_aottest.cpp $(FILTERS_DIR)/msan.a $(FILTERS_DIR)/msan.h $(RUNTIME_EXPORTED_INCLUDES)
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter-out %.h,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-# alias has additional deps to link in
-$(BIN_DIR)/$(TARGET)/generator_aot_alias: $(ROOT_DIR)/test/generator/alias_aottest.cpp $(FILTERS_DIR)/alias.a $(FILTERS_DIR)/alias_with_offset_42.a $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_alias: $(ROOT_DIR)/test/generator/alias_aottest.cpp $(FILTERS_DIR)/alias.cpp $(FILTERS_DIR)/alias_with_offset_42.cpp $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-# nested_externs has additional deps to link in
-$(BIN_DIR)/$(TARGET)/generator_aot_nested_externs: $(ROOT_DIR)/test/generator/nested_externs_aottest.cpp $(FILTERS_DIR)/nested_externs_root.a $(FILTERS_DIR)/nested_externs_inner.a $(FILTERS_DIR)/nested_externs_combine.a $(FILTERS_DIR)/nested_externs_leaf.a $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_nested_externs: $(ROOT_DIR)/test/generator/nested_externs_aottest.cpp $(FILTERS_DIR)/nested_externs_root.cpp $(FILTERS_DIR)/nested_externs_inner.cpp $(FILTERS_DIR)/nested_externs_combine.cpp $(FILTERS_DIR)/nested_externs_leaf.cpp $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) -o $@
-
-# The matlab tests needs "-matlab" in the runtime
-$(BIN_DIR)/$(TARGET)/generator_aot_matlab: $(ROOT_DIR)/test/generator/matlab_aottest.cpp $(FILTERS_DIR)/matlab.a $(FILTERS_DIR)/matlab.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)-matlab/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(TEST_LD_FLAGS) -o $@
-
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_matlab: $(ROOT_DIR)/test/generator/matlab_aottest.cpp $(FILTERS_DIR)/matlab.cpp $(FILTERS_DIR)/matlab.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)-matlab/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(TEST_LD_FLAGS) -o $@
-
-# The gpu object lifetime test needs the debug runtime
-$(BIN_DIR)/$(TARGET)/generator_aot_gpu_object_lifetime: $(ROOT_DIR)/test/generator/gpu_object_lifetime_aottest.cpp $(FILTERS_DIR)/gpu_object_lifetime.a $(FILTERS_DIR)/gpu_object_lifetime.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)-debug/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(TEST_LD_FLAGS) -o $@
-
-# acquire_release explicitly uses CUDA/OpenCL APIs, so link those here.
-$(BIN_DIR)/$(TARGET)/generator_aot_acquire_release: $(ROOT_DIR)/test/generator/acquire_release_aottest.cpp $(FILTERS_DIR)/acquire_release.a $(FILTERS_DIR)/acquire_release.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(OPENCL_LD_FLAGS) $(CUDA_LD_FLAGS) -o $@
-
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_acquire_release: $(ROOT_DIR)/test/generator/acquire_release_aottest.cpp $(FILTERS_DIR)/acquire_release.cpp $(FILTERS_DIR)/acquire_release.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(OPENCL_LD_FLAGS) $(CUDA_LD_FLAGS) -o $@
-
-# define_extern_opencl explicitly uses OpenCL APIs, so link those here.
-$(BIN_DIR)/$(TARGET)/generator_aot_define_extern_opencl: $(ROOT_DIR)/test/generator/define_extern_opencl_aottest.cpp $(FILTERS_DIR)/define_extern_opencl.a $(FILTERS_DIR)/define_extern_opencl.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(OPENCL_LD_FLAGS) -o $@
-
-$(BIN_DIR)/$(TARGET)/generator_aotcpp_define_extern_opencl: $(ROOT_DIR)/test/generator/define_extern_opencl_aottest.cpp $(FILTERS_DIR)/define_extern_opencl.cpp $(FILTERS_DIR)/define_extern_opencl.h $(RUNTIME_EXPORTED_INCLUDES) $(BIN_DIR)/$(TARGET)/runtime.a
-	@mkdir -p $(@D)
-	$(CXX) $(GEN_AOT_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) $(GEN_AOT_INCLUDES) $(GEN_AOT_LD_FLAGS) $(OPENCL_LD_FLAGS) -o $@
-
-# By default, %_jittest.cpp depends on libHalide, plus the stubs for the Generator. These are external tests that use the JIT.
-$(BIN_DIR)/generator_jit_%: $(ROOT_DIR)/test/generator/%_jittest.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(FILTERS_DIR)/%.stub.h $(BUILD_DIR)/%_generator.o
-	@mkdir -p $(@D)
-	$(CXX) -g $(TEST_CXX_FLAGS) $(filter %.cpp %.o %.a,$^) -I$(INCLUDE_DIR) -I$(FILTERS_DIR) -I $(ROOT_DIR)/apps/support $(TEST_LD_FLAGS) -o $@
-
-# generator_aot_multitarget is run multiple times, with different env vars.
-generator_aot_multitarget: $(BIN_DIR)/$(TARGET)/generator_aot_multitarget
-	@mkdir -p $(@D)
-	HL_MULTITARGET_TEST_USE_DEBUG_FEATURE=0 $(CURDIR)/$<
-	HL_MULTITARGET_TEST_USE_DEBUG_FEATURE=1 $(CURDIR)/$<
-	@-echo
-
-# nested externs doesn't actually contain a generator named
-# "nested_externs", and has no internal tests in any case.
-test_generator_nested_externs:
-	@echo "Skipping"
-
-$(BUILD_DIR)/RunGen.o: $(ROOT_DIR)/tools/RunGen.cpp $(RUNTIME_EXPORTED_INCLUDES)
-	@mkdir -p $(@D)
-	$(CXX) -c $< $(TEST_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) -I$(INCLUDE_DIR) -I $(SRC_DIR)/runtime -I$(ROOT_DIR)/tools -o $@
-
-$(FILTERS_DIR)/%.rungen: $(BUILD_DIR)/RunGen.o $(BIN_DIR)/$(TARGET)/runtime.a $(ROOT_DIR)/tools/RunGenStubs.cpp $(FILTERS_DIR)/%.a
-	@mkdir -p $(@D)
-	$(CXX) -std=c++11 -DHL_RUNGEN_FILTER_HEADER=\"$*.h\" -I$(FILTERS_DIR) $^ $(GEN_AOT_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-
-RUNARGS ?=
-
-$(FILTERS_DIR)/%.run: $(FILTERS_DIR)/%.rungen
-	$(CURDIR)/$< $(RUNARGS)
-	@-echo
-
-$(BIN_DIR)/tutorial_%: $(ROOT_DIR)/tutorial/%.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h
-	@ if [[ $@ == *_run ]]; then \
-		export TUTORIAL=$* ;\
-		export LESSON=`echo $${TUTORIAL} | cut -b1-9`; \
-		make -f $(THIS_MAKEFILE) tutorial_$${TUTORIAL/run/generate}; \
-		$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< \
-		-I$(TMP_DIR) -I$(INCLUDE_DIR) $(TMP_DIR)/$${LESSON}_*.a $(GEN_AOT_LD_FLAGS) $(IMAGE_IO_LIBS) -lz -o $@; \
-	else \
-		$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< \
-		-I$(INCLUDE_DIR) -I$(ROOT_DIR)/tools $(TEST_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@;\
-	fi
-
-$(BIN_DIR)/tutorial_lesson_15_generators: $(ROOT_DIR)/tutorial/lesson_15_generators.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(BUILD_DIR)/GenGen.o
-	$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< $(BUILD_DIR)/GenGen.o \
-	-I$(INCLUDE_DIR) $(TEST_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-
-tutorial_lesson_15_generators: $(ROOT_DIR)/tutorial/lesson_15_generators_usage.sh $(BIN_DIR)/tutorial_lesson_15_generators
-	@-mkdir -p $(TMP_DIR)
-	cp $(BIN_DIR)/tutorial_lesson_15_generators $(TMP_DIR)/lesson_15_generate; \
-	cd $(TMP_DIR); \
-	PATH="$${PATH}:$(CURDIR)/$(BIN_DIR)" source $(ROOT_DIR)/tutorial/lesson_15_generators_usage.sh
-	@-echo
-
-$(BIN_DIR)/tutorial_lesson_16_rgb_generate: $(ROOT_DIR)/tutorial/lesson_16_rgb_generate.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(BUILD_DIR)/GenGen.o
-	$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< $(BUILD_DIR)/GenGen.o \
-	-I$(INCLUDE_DIR) $(TEST_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-
-$(BIN_DIR)/tutorial_lesson_16_rgb_run: $(ROOT_DIR)/tutorial/lesson_16_rgb_run.cpp $(BIN_DIR)/tutorial_lesson_16_rgb_generate
-	@-mkdir -p $(TMP_DIR)
-	# Run the generator
-	$(BIN_DIR)/tutorial_lesson_16_rgb_generate -g brighten -o $(TMP_DIR) -f brighten_planar      target=host layout=planar
-	$(BIN_DIR)/tutorial_lesson_16_rgb_generate -g brighten -o $(TMP_DIR) -f brighten_interleaved target=host-no_runtime layout=interleaved
-	$(BIN_DIR)/tutorial_lesson_16_rgb_generate -g brighten -o $(TMP_DIR) -f brighten_either      target=host-no_runtime layout=either
-	$(BIN_DIR)/tutorial_lesson_16_rgb_generate -g brighten -o $(TMP_DIR) -f brighten_specialized target=host-no_runtime layout=specialized
-	# Compile the runner
-	$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< \
-	-I$(INCLUDE_DIR) -L$(BIN_DIR) -I $(TMP_DIR) $(TMP_DIR)/brighten_*.a \
-        -lHalide $(TEST_LD_FLAGS) $(COMMON_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-	@-echo
-
-$(BIN_DIR)/tutorial_lesson_21_auto_scheduler_generate: $(ROOT_DIR)/tutorial/lesson_21_auto_scheduler_generate.cpp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(BUILD_DIR)/GenGen.o
-	$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< $(BUILD_DIR)/GenGen.o \
-	-I$(INCLUDE_DIR) $(TEST_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-
-# The values in MachineParams are:
-# - the maximum level of parallelism available,
-# - the size of the last-level cache (in KB),
-# - the ratio between the cost of a miss at the last level cache and the cost
-#   of arithmetic on the target architecture
-# ...in that order.
-LESSON_21_MACHINE_PARAMS = 32,16777216,40
-
-$(BIN_DIR)/tutorial_lesson_21_auto_scheduler_run: $(ROOT_DIR)/tutorial/lesson_21_auto_scheduler_run.cpp $(BIN_DIR)/tutorial_lesson_21_auto_scheduler_generate
-	@-mkdir -p $(TMP_DIR)
-	# Run the generator
-	$(BIN_DIR)/tutorial_lesson_21_auto_scheduler_generate -g auto_schedule_gen -o $(TMP_DIR) -e static_library,h,schedule -f auto_schedule_false target=host            auto_schedule=false
-	$(BIN_DIR)/tutorial_lesson_21_auto_scheduler_generate -g auto_schedule_gen -o $(TMP_DIR) -e static_library,h,schedule -f auto_schedule_true  target=host-no_runtime auto_schedule=true machine_params=$(LESSON_21_MACHINE_PARAMS)
-	# Compile the runner
-	$(CXX) $(TUTORIAL_CXX_FLAGS) $(IMAGE_IO_CXX_FLAGS) $(OPTIMIZE_FOR_BUILD_TIME) $< \
-	-I$(INCLUDE_DIR) -L$(BIN_DIR) -I $(TMP_DIR) $(TMP_DIR)/auto_schedule_*.a \
-        -lHalide $(TEST_LD_FLAGS) $(COMMON_LD_FLAGS) $(IMAGE_IO_LIBS) -o $@
-	@-echo
-
-test_internal: $(BIN_DIR)/test_internal
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-correctness_%: $(BIN_DIR)/correctness_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-valgrind_%: $(BIN_DIR)/correctness_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; valgrind --error-exitcode=-1 $(CURDIR)/$<
-	@-echo
-
-# Use Intel SDE to emulate an avx 512 processor.
-avx512_%: $(BIN_DIR)/correctness_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; sde -cnl -- $(CURDIR)/$<
-	cd $(TMP_DIR) ; sde -knl -- $(CURDIR)/$<
-	@-echo
-
-# This test is *supposed* to do an out-of-bounds read, so skip it when testing under valgrind
-valgrind_tracing_stack: $(BIN_DIR)/correctness_tracing_stack
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$(BIN_DIR)/correctness_tracing_stack
-	@-echo
-
-performance_%: $(BIN_DIR)/performance_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-error_%: $(BIN_DIR)/error_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$< 2>&1 | egrep --q "terminating with uncaught exception|^terminate called|^Error|Assertion.*failed"
-	@-echo
-
-warning_%: $(BIN_DIR)/warning_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$< 2>&1 | egrep --q "^Warning"
-	@-echo
-
-opengl_%: $(BIN_DIR)/opengl_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$< 2>&1
-	@-echo
-
-generator_jit_%: $(BIN_DIR)/generator_jit_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-generator_aot_%: $(BIN_DIR)/$(TARGET)/generator_aot_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-generator_aotcpp_%: $(BIN_DIR)/$(TARGET)/generator_aotcpp_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-$(TMP_DIR)/images/%.png: $(ROOT_DIR)/tutorial/images/%.png
-	@-mkdir -p $(TMP_DIR)/images
-	cp $< $(TMP_DIR)/images/
-
-tutorial_%: $(BIN_DIR)/tutorial_% $(TMP_DIR)/images/rgb.png $(TMP_DIR)/images/gray.png
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-auto_schedule_%: $(BIN_DIR)/auto_schedule_%
-	@-mkdir -p $(TMP_DIR)
-	cd $(TMP_DIR) ; $(CURDIR)/$<
-	@-echo
-
-time_compilation_test_%: $(BIN_DIR)/test_%
-	$(TIME_COMPILATION) compile_times_correctness.csv make -f $(THIS_MAKEFILE) $(@:time_compilation_test_%=test_%)
-
-time_compilation_performance_%: $(BIN_DIR)/performance_%
-	$(TIME_COMPILATION) compile_times_performance.csv make -f $(THIS_MAKEFILE) $(@:time_compilation_performance_%=performance_%)
-
-time_compilation_opengl_%: $(BIN_DIR)/opengl_%
-	$(TIME_COMPILATION) compile_times_opengl.csv make -f $(THIS_MAKEFILE) $(@:time_compilation_opengl_%=opengl_%)
-
-time_compilation_generator_%: $(BIN_DIR)/%.generator
-	$(TIME_COMPILATION) compile_times_generator.csv make -f $(THIS_MAKEFILE) $(@:time_compilation_generator_%=$(FILTERS_DIR)/%.a)
-
-TEST_APPS=\
-	HelloMatlab \
-	bilateral_grid \
-	blur \
-	camera_pipe \
-	c_backend \
-	conv_layer \
-	fft \
-	interpolate \
-	lens_blur \
-	linear_algebra \
-	local_laplacian \
-	nl_means \
-	resize \
-	wavelet \
-
-.PHONY: test_apps
-test_apps: distrib
-	@for APP in $(TEST_APPS); do \
-		echo Testing app $${APP}... ; \
-		make -C $(ROOT_DIR)/apps/$${APP} test HALIDE_BIN_PATH=$(CURDIR) HALIDE_SRC_PATH=$(ROOT_DIR) BIN=$(CURDIR)/$(BIN_DIR)/apps/$${APP} || exit 1 ; \
-	done
-
-# Bazel depends on the distrib archive being built
-.PHONY: test_bazel
-test_bazel: $(DISTRIB_DIR)/halide.tgz
-	# Only test bazeldemo if Bazel is installed
-	if [ -z "$(BAZEL)" ]; then echo "Bazel is not installed"; exit 1; fi
-	mkdir -p apps
-	# Make a local copy of the apps if we're building out-of-tree,
-	# because the app Makefiles are written to build in-tree
-	if [ "$(ROOT_DIR)" != "$(CURDIR)" ]; then \
-	  echo "Building out-of-tree, so making local copy of apps"; \
-	  cp -r $(ROOT_DIR)/apps/bazeldemo apps; \
-	  cp -r $(ROOT_DIR)/tools .; \
-	fi
-	cd apps/bazeldemo; \
-	CXX=`echo ${CXX} | sed 's/ccache //'` \
-	CC=`echo ${CC} | sed 's/ccache //'` \
-	bazel build --verbose_failures :all
-
-.PHONY: test_python2
-test_python2: distrib $(BIN_DIR)/host/runtime.a
-	make -C $(ROOT_DIR)/python_bindings \
-		-f $(ROOT_DIR)/python_bindings/Makefile \
-		test \
-		HALIDE_PATH=$(ROOT_DIR) \
-		HALIDE_DISTRIB_PATH=$(CURDIR)/$(DISTRIB_DIR) \
-		BIN=$(CURDIR)/$(BIN_DIR)/python2_bindings \
-		PYTHON=python \
-		PYBIND11_PATH=$(REAL_PYBIND11_PATH)
-
-.PHONY: test_python
-test_python: distrib $(BIN_DIR)/host/runtime.a
-	make -C $(ROOT_DIR)/python_bindings \
-		-f $(ROOT_DIR)/python_bindings/Makefile \
-		test \
-		HALIDE_PATH=$(ROOT_DIR) \
-		HALIDE_DISTRIB_PATH=$(CURDIR)/$(DISTRIB_DIR) \
-		BIN=$(CURDIR)/$(BIN_DIR)/python3_bindings \
-		PYTHON=python3 \
-		PYBIND11_PATH=$(REAL_PYBIND11_PATH)
-
-# It's just for compiling the runtime, so earlier clangs *might* work,
-# but best to peg it to the minimum llvm version.
-ifneq (,$(findstring clang version 3.7,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq (,$(findstring clang version 3.8,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq (,$(findstring clang version 4.0,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq (,$(findstring clang version 5.0,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq (,$(findstring clang version 6.0,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq (,$(findstring clang version 7.0,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq (,$(findstring Apple LLVM version 5.0,$(CLANG_VERSION)))
-CLANG_OK=yes
-endif
-
-ifneq ($(CLANG_OK), )
-$(BUILD_DIR)/clang_ok:
-	@echo "Found a new enough version of clang"
-	mkdir -p $(BUILD_DIR)
-	touch $(BUILD_DIR)/clang_ok
-else
-$(BUILD_DIR)/clang_ok:
-	@echo "Can't find clang or version of clang too old (we need 3.7 or greater):"
-	@echo "You can override this check by setting CLANG_OK=y"
-	echo '$(CLANG_VERSION)'
-	echo $(findstring version 3,$(CLANG_VERSION))
-	echo $(findstring version 3.0,$(CLANG_VERSION))
-	$(CLANG) --version
-	@exit 1
-endif
-
-ifneq (,$(findstring $(LLVM_VERSION_TIMES_10), 40 50 60 70))
-LLVM_OK=yes
-endif
-
-ifneq ($(LLVM_OK), )
-$(BUILD_DIR)/llvm_ok: $(BUILD_DIR)/rtti_ok
-	@echo "Found a new enough version of llvm"
-ifeq ($(LLVM_VERSION_TIMES_10), 40)
-	@echo
-	@echo "*** Warning: LLVM 4.x is no longer actively tested with Halide; consider using a newer LLVM version. ***"
-	@echo
-endif
-	mkdir -p $(BUILD_DIR)
-	touch $(BUILD_DIR)/llvm_ok
-else
-$(BUILD_DIR)/llvm_ok:
-	@echo "Can't find llvm or version of llvm too old (we need 4.0 or greater):"
-	@echo "You can override this check by setting LLVM_OK=y"
-	$(LLVM_CONFIG) --version
-	@exit 1
-endif
-
-ifneq ($(WITH_RTTI), )
-ifneq ($(LLVM_HAS_NO_RTTI), )
-else
-RTTI_OK=yes # Enabled in Halide and LLVM
-endif
-else
-RTTI_OK=yes # Enabled in LLVM but not in Halide
-endif
-
-ifneq ($(RTTI_OK), )
-$(BUILD_DIR)/rtti_ok:
-	mkdir -p $(BUILD_DIR)
-	touch $(BUILD_DIR)/rtti_ok
-else
-$(BUILD_DIR)/rtti_ok:
-	@echo "Can't enable RTTI - llvm was compiled without it."
-	@echo "LLVM c++ flags: " $(LLVM_CXX_FLAGS)
-	@exit 1
-endif
-
-.PHONY: doc
-$(DOC_DIR): doc
-doc: $(SRC_DIR) Doxyfile
-	doxygen
-
-Doxyfile: Doxyfile.in
-	@echo "Generating $@"
-	@sed -e "s#@CMAKE_BINARY_DIR@#$(shell pwd)#g" \
-	     -e "s#@CMAKE_SOURCE_DIR@#$(shell pwd)#g" \
-	    $< > $@
-
-install: $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(RUNTIME_EXPORTED_INCLUDES)
-	mkdir -p $(PREFIX)/include $(PREFIX)/bin $(PREFIX)/lib $(PREFIX)/share/halide/tutorial/images $(PREFIX)/share/halide/tools $(PREFIX)/share/halide/tutorial/figures
-	cp $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(PREFIX)/lib
-	cp $(INCLUDE_DIR)/Halide.h $(PREFIX)/include
-	cp $(INCLUDE_DIR)/HalideBuffer.h $(PREFIX)/include
-	cp $(INCLUDE_DIR)/HalideRuntim*.h $(PREFIX)/include
-	cp $(ROOT_DIR)/tutorial/images/*.png $(PREFIX)/share/halide/tutorial/images
-	cp $(ROOT_DIR)/tutorial/figures/*.gif $(PREFIX)/share/halide/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/figures/*.jpg $(PREFIX)/share/halide/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/figures/*.mp4 $(PREFIX)/share/halide/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/*.cpp $(PREFIX)/share/halide/tutorial
-	cp $(ROOT_DIR)/tutorial/*.h $(PREFIX)/share/halide/tutorial
-	cp $(ROOT_DIR)/tutorial/*.sh $(PREFIX)/share/halide/tutorial
-	cp $(ROOT_DIR)/tools/mex_halide.m $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/GenGen.cpp $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/RunGen.cpp $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/RunGenStubs.cpp $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/halide_image.h $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/halide_image_io.h $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/halide_image_info.h $(PREFIX)/share/halide/tools
-ifeq ($(UNAME), Darwin)
-	install_name_tool -id $(PREFIX)/lib/libHalide.$(SHARED_EXT) $(PREFIX)/lib/libHalide.$(SHARED_EXT)
-endif
-
-# This is a specialized 'install' for users who need Hexagon support libraries as well.
-install_qc: install $(HEXAGON_RUNTIME_LIBS)
-	mkdir -p $(PREFIX)/lib/arm-32-android $(PREFIX)/lib/arm-64-android $(PREFIX)/lib/host $(PREFIX)/lib/v60 $(PREFIX)/tools
-	cp $(ROOT_DIR)/tools/sim_qurt/libsim_qurt.a $(PREFIX)/lib
-	cp $(HEXAGON_RUNTIME_LIBS_DIR)/arm-32-android/* $(PREFIX)/lib/arm-32-android
-	cp $(HEXAGON_RUNTIME_LIBS_DIR)/arm-64-android/* $(PREFIX)/lib/arm-64-android
-	cp $(HEXAGON_RUNTIME_LIBS_DIR)/host/* $(PREFIX)/lib/host
-	cp -r $(HEXAGON_RUNTIME_LIBS_DIR)/v60/* $(PREFIX)/lib/v60
-	ln -sf $(PREFIX)/share/halide/tools/GenGen.cpp $(PREFIX)/tools/GenGen.cpp
-	ln -sf $(PREFIX)/lib/v60/hexagon_sim_remote $(PREFIX)/bin/hexagon_sim_remote
-
-# We need to capture the system libraries that we'll need to link
-# against, so that downstream consumers of our build rules don't
-# have to guess what's necessary on their system; call
-# llvm-config and capture the result in config files that
-# we include in our distribution.
-$(BUILD_DIR)/halide_config.%: $(ROOT_DIR)/tools/halide_config.%.tpl
-	@mkdir -p $(@D)
-	cat $< | sed -e 's/@HALIDE_SYSTEM_LIBS_RAW@/${LLVM_SYSTEM_LIBS}/g' > $@
-
-$(DISTRIB_DIR)/halide.tgz: $(LIB_DIR)/libHalide.a \
-						   $(BIN_DIR)/libHalide.$(SHARED_EXT) \
-						   $(INCLUDE_DIR)/Halide.h \
-						   $(RUNTIME_EXPORTED_INCLUDES) \
-						   $(ROOT_DIR)/README*.md \
-						   $(ROOT_DIR)/bazel/* \
-						   $(BUILD_DIR)/halide_config.bzl \
-						   $(BUILD_DIR)/halide_config.cmake \
-						   $(ROOT_DIR)/halide.cmake
-	mkdir -p $(DISTRIB_DIR)/include \
-	         $(DISTRIB_DIR)/bin \
-	         $(DISTRIB_DIR)/lib \
-	         $(DISTRIB_DIR)/tutorial \
-	         $(DISTRIB_DIR)/tutorial/images \
-	         $(DISTRIB_DIR)/tools \
-	         $(DISTRIB_DIR)/tutorial/figures
-	cp $(BIN_DIR)/libHalide.$(SHARED_EXT) $(DISTRIB_DIR)/bin
-	cp $(LIB_DIR)/libHalide.a $(DISTRIB_DIR)/lib
-	cp $(INCLUDE_DIR)/Halide.h $(DISTRIB_DIR)/include
-	cp $(INCLUDE_DIR)/HalideBuffer.h $(DISTRIB_DIR)/include
-	cp $(INCLUDE_DIR)/HalideRuntim*.h $(DISTRIB_DIR)/include
-	cp $(ROOT_DIR)/tutorial/images/*.png $(DISTRIB_DIR)/tutorial/images
-	cp $(ROOT_DIR)/tutorial/figures/*.gif $(DISTRIB_DIR)/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/figures/*.jpg $(DISTRIB_DIR)/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/figures/*.mp4 $(DISTRIB_DIR)/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/*.cpp $(DISTRIB_DIR)/tutorial
-	cp $(ROOT_DIR)/tutorial/*.h $(DISTRIB_DIR)/tutorial
-	cp $(ROOT_DIR)/tutorial/*.sh $(DISTRIB_DIR)/tutorial
-	cp $(ROOT_DIR)/tools/mex_halide.m $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/GenGen.cpp $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/RunGen.cpp $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/RunGenStubs.cpp $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/halide_benchmark.h $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/halide_image.h $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/halide_image_io.h $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/halide_image_info.h $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/tools/halide_trace_config.h $(DISTRIB_DIR)/tools
-	cp $(ROOT_DIR)/README*.md $(DISTRIB_DIR)
-	cp $(ROOT_DIR)/bazel/BUILD $(DISTRIB_DIR)
-	cp $(ROOT_DIR)/bazel/halide.bzl $(DISTRIB_DIR)
-	cp $(ROOT_DIR)/bazel/README_bazel.md $(DISTRIB_DIR)
-	cp $(ROOT_DIR)/bazel/WORKSPACE $(DISTRIB_DIR)
-	cp $(BUILD_DIR)/halide_config.* $(DISTRIB_DIR)
-	cp $(ROOT_DIR)/halide.cmake $(DISTRIB_DIR)
-	ln -sf $(DISTRIB_DIR) halide
-	tar -czf $(DISTRIB_DIR)/halide.tgz \
-		halide/bin \
-		halide/lib \
-		halide/include \
-		halide/tutorial \
-		halide/BUILD \
-		halide/README*.md \
-		halide/README_bazel.md \
-		halide/WORKSPACE \
-		halide/*.bzl \
-		halide/*.cmake \
-		halide/tools/mex_halide.m \
-		halide/tools/*.cpp \
-		halide/tools/halide_benchmark.h \
-		halide/tools/halide_image.h \
-		halide/tools/halide_image_io.h \
-		halide/tools/halide_image_info.h \
-		halide/tools/halide_trace_config.h
-	rm -rf halide
-
-.PHONY: distrib
-distrib: $(DISTRIB_DIR)/halide.tgz
-
-$(BIN_DIR)/HalideTraceViz: $(ROOT_DIR)/util/HalideTraceViz.cpp $(INCLUDE_DIR)/HalideRuntime.h $(ROOT_DIR)/tools/halide_image_io.h $(ROOT_DIR)/tools/halide_trace_config.h
-	$(CXX) $(OPTIMIZE) -std=c++11 $(filter %.cpp,$^) -I$(INCLUDE_DIR) -I$(ROOT_DIR)/tools -L$(BIN_DIR) -o $@
-
-$(BIN_DIR)/HalideTraceDump: $(ROOT_DIR)/util/HalideTraceDump.cpp $(ROOT_DIR)/util/HalideTraceUtils.cpp $(INCLUDE_DIR)/HalideRuntime.h $(ROOT_DIR)/tools/halide_image_io.h
-	$(CXX) $(OPTIMIZE) -std=c++11 $(filter %.cpp,$^) -I$(INCLUDE_DIR) -I$(ROOT_DIR)/tools -I$(ROOT_DIR)/src/runtime -L$(BIN_DIR) $(IMAGE_IO_CXX_FLAGS) $(IMAGE_IO_LIBS) -o $@
+#include <iostream>
+#include <mutex>
+#include <sstream>
+
+#include "AlignLoads.h"
+#include "CSE.h"
+#include "CodeGen_Hexagon.h"
+#include "CodeGen_Internal.h"
+#include "Debug.h"
+#include "EliminateBoolVectors.h"
+#include "HexagonOptimize.h"
+#include "IREquality.h"
+#include "IRMatch.h"
+#include "IRMutator.h"
+#include "IROperator.h"
+#include "IRPrinter.h"
+#include "LICM.h"
+#include "LLVM_Headers.h"
+#include "LoopCarry.h"
+#include "Simplify.h"
+#include "Substitute.h"
+#include "Target.h"
+#include "Util.h"
+
+namespace Halide {
+namespace Internal {
+
+using std::string;
+using std::vector;
+
+using namespace llvm;
+
+// LLVM Hexagon HVX intrinsics are broken up into 64B and 128B versions, for example,
+// llvm::Intrinsic::hexagon_V6_vaddh and llvm::Intrinsic::hexagon_V6_vaddh_128B. This
+// macro selects the 64B or 128B mode depending on the value of is_128B. There's a
+// further dirty hack here: these intrinsics aren't defined in LLVM older than 3.9. To
+// avoid needing to #ifdef random patches of code, we just replace all LLVM intrinsics
+// with not_intrinsic.
+#ifdef WITH_HEXAGON
+
+#define IPICK(is_128B, i64) (is_128B ? i64##_128B : i64)
+#else
+#define IPICK(is_128B, i64) (is_128B ? Intrinsic::not_intrinsic : Intrinsic::not_intrinsic)
+#endif
+
+CodeGen_Hexagon::CodeGen_Hexagon(Target t) : CodeGen_Posix(t) {
+#if !(WITH_HEXAGON)
+    user_error << "hexagon not enabled for this build of Halide.\n";
+#endif
+#if LLVM_VERSION < 50
+    user_assert(!t.has_feature(Target::HVX_v62))
+        << "llvm 5.0 or later is required for Hexagon v62.\n";
+    user_assert(!t.has_feature(Target::HVX_v65))
+        << "llvm 5.0 or later is required for Hexagon v65.\n";
+    user_assert(!t.has_feature(Target::HVX_v66))
+        << "llvm 5.0 or later is required for Hexagon v66.\n";
+#endif
+    user_assert(llvm_Hexagon_enabled) << "llvm build not configured with Hexagon target enabled.\n";
+}
+
+std::unique_ptr<llvm::Module> CodeGen_Hexagon::compile(const Module &module) {
+    auto llvm_module = CodeGen_Posix::compile(module);
+
+    // TODO: This should be set on the module itself, or some other
+    // safer way to pass this through to the target specific lowering
+    // passes. We set the option here (after the base class'
+    // implementation of compile) because it is the last
+    // Hexagon-specific code to run prior to invoking the target
+    // specific lowering in LLVM, minimizing the chances of the wrong
+    // flag being set for the wrong module.
+    static std::once_flag set_options_once;
+    std::call_once(set_options_once, []() {
+        cl::ParseEnvironmentOptions("halide-hvx-be", "HALIDE_LLVM_ARGS",
+                                    "Halide HVX internal compiler\n");
+
+        std::vector<const char *> options = {
+            "halide-hvx-be",
+            // Don't put small objects into .data sections, it causes
+            // issues with position independent code.
+            "-hexagon-small-data-threshold=0"
+        };
+        cl::ParseCommandLineOptions(options.size(), options.data());
+    });
+
+    if (module.target().features_all_of({Halide::Target::HVX_128, Halide::Target::HVX_64})) {
+        user_error << "Both HVX_64 and HVX_128 set at same time\n";
+    }
+
+    return llvm_module;
+}
+
+namespace {
+
+Stmt call_halide_qurt_hvx_lock(const Target &target) {
+    Expr hvx_mode = target.has_feature(Target::HVX_128) ? 128 : 64;
+    Expr hvx_lock = Call::make(Int(32), "halide_qurt_hvx_lock", {hvx_mode}, Call::Extern);
+    string hvx_lock_result_name = unique_name("hvx_lock_result");
+    Expr hvx_lock_result_var = Variable::make(Int(32), hvx_lock_result_name);
+    Stmt check_hvx_lock = LetStmt::make(hvx_lock_result_name, hvx_lock,
+                                        AssertStmt::make(EQ::make(hvx_lock_result_var, 0), hvx_lock_result_var));
+    return check_hvx_lock;
+}
+Stmt call_halide_qurt_hvx_unlock() {
+    Expr hvx_unlock = Call::make(Int(32), "halide_qurt_hvx_unlock", {}, Call::Extern);
+    string hvx_unlock_result_name = unique_name("hvx_unlock_result");
+    Expr hvx_unlock_result_var = Variable::make(Int(32), hvx_unlock_result_name);
+    Stmt check_hvx_unlock = LetStmt::make(hvx_unlock_result_name, hvx_unlock,
+                                          AssertStmt::make(EQ::make(hvx_unlock_result_var, 0), hvx_unlock_result_var));
+    return check_hvx_unlock;
+}
+// Wrap the stmt in a call to qurt_hvx_lock, calling qurt_hvx_unlock
+// as a destructor if successful.
+Stmt acquire_hvx_context(Stmt stmt, const Target &target) {
+    // Modify the stmt to add a call to halide_qurt_hvx_lock, and
+    // register a destructor to call halide_qurt_hvx_unlock.
+    Stmt check_hvx_lock = call_halide_qurt_hvx_lock(target);
+    Expr dummy_obj = reinterpret(Handle(), cast<uint64_t>(1));
+    Expr hvx_unlock = Call::make(Int(32), Call::register_destructor,
+                                 {Expr("halide_qurt_hvx_unlock_as_destructor"), dummy_obj}, Call::Intrinsic);
+
+    stmt = Block::make(Evaluate::make(hvx_unlock), stmt);
+    stmt = Block::make(check_hvx_lock, stmt);
+    return stmt;
+}
+bool is_dense_ramp(Expr x) {
+    const Ramp *r = x.as<Ramp>();
+    if (!r) return false;
+
+    return is_one(r->stride);
+}
+
+// In Hexagon, we assume that we can read one vector past the end of
+// buffers. Using this assumption, this mutator replaces vector
+// predicated dense loads with scalar predicated dense loads.
+class SloppyUnpredicateLoads : public IRMutator2 {
+    Expr visit(const Load *op) override {
+        // Don't handle loads with without predicates, scalar predicates, or non-dense ramps.
+        if (is_one(op->predicate) || op->predicate.as<Broadcast>() || !is_dense_ramp(op->index)) {
+            return IRMutator2::visit(op);
+        }
+
+        Expr predicate = mutate(op->predicate);
+        Expr index = mutate(op->index);
+
+        // Make the predicate into a scalar that is true if any of the lanes are true.
+        Expr condition = Shuffle::make({predicate}, {0});
+        for (int i = 1; i < op->type.lanes(); i++) {
+            condition = condition || Shuffle::make({predicate}, {i});
+        }
+        predicate = Broadcast::make(condition, predicate.type().lanes());
+
+        return Load::make(op->type, op->name, index, op->image, op->param, predicate);
+    }
+
+    using IRMutator2::visit;
+};
+
+Stmt sloppy_unpredicate_loads(Stmt s) {
+    return SloppyUnpredicateLoads().mutate(s);
+}
+
+class InjectHVXLocks : public IRMutator2 {
+public:
+    InjectHVXLocks(const Target &t) : target(t) {
+        uses_hvx_var = Variable::make(Bool(), "uses_hvx");
+    }
+    bool uses_hvx = false;
+private:
+    Expr uses_hvx_var;
+    using IRMutator2::visit;
+    // Primarily, we do two things when we encounter a parallel for loop.
+    // First, we check if the paralell for loop uses_hvx and accordingly
+    // acqure_hvx_context i.e. acquire and release HVX locks.
+    // Then we insert a conditional unlock before the for loop, let's call
+    // this the prolog, and a conditional lock after the for loop which
+    // we shall call the epilog. So the code for a parallel loop that uses
+    // hvx should look like so.
+    //
+    // if (uses_hvx_var) {
+    //     halide_qurt_hvx_unlock();
+    // }
+    // parallel_for {
+    //     halide_qurt_hvx_lock();
+    //     ...
+    //     ...
+    //     halide_qurt_hvx_unlock();
+    // }
+    // if (uses_hvx_var) {
+    //     halide_qurt_hvx_lock();
+    // }
+    //
+    // When we move up to the enclosing scope we substitute the value of uses_hvx
+    // into the IR that should convert the conditionals to constants.
+    Stmt visit(const For *op) {
+        if (op->for_type == ForType::Parallel) {
+            bool old_uses_hvx = uses_hvx;
+            uses_hvx = false;
+
+            Stmt body = mutate(op->body);
+            Stmt s;
+            if (uses_hvx) {
+                body = acquire_hvx_context(body, target);
+                body = substitute("uses_hvx", true, body);
+                Stmt new_for = For::make(op->name, op->min, op->extent,
+                                         op->for_type, op->device_api, body);
+                Stmt prolog = IfThenElse::make(uses_hvx_var,
+                                               call_halide_qurt_hvx_unlock());
+                Stmt epilog = IfThenElse::make(uses_hvx_var,
+                                               call_halide_qurt_hvx_lock(target));
+                s = Block::make({prolog, new_for, epilog});
+                debug(4) << "Wrapping prolog & epilog around par loop\n" << s << "\n";
+            } else {
+                // We do not substitute false for "uses_hvx" into the body as we do in the true
+                // case because we want to defer that to an enclosing scope. The logic is that
+                // in case this scope doesn't use_hvx (we are here in the else because of that)
+                // then an enclosing scope might. However, substituting false for "uses_hvx"
+                // at this stage will remove the prolog and epilog checks that will be needed
+                // as the enclosing scope uses hvx. This is exhibited by the following code
+                // structure
+                //
+                // for_par(z..) {//uses hvx
+                //   for_par(y..) {  // doesn't use hvx
+                //     for_par(x..) { // uses hvx
+                //        vector code
+                //     }
+                //   }
+                //   vector code
+                // }
+                // If we substitute false in the else here, we'll get
+                // for_par(z.) {
+                //   halide_qurt_hvx_lock();
+                //   for_par(y..) {
+                //     if (false) {
+                //        halide_qurt_hvx_unlock(); // will get optimized away.
+                //     }
+                //     for_par(x..) {
+                //        halide_qurt_hvx_lock();  // double lock. Not good.
+                //        vector code
+                //        halide_qurt_hvx_unlock();
+                //     }
+                //     if (false) {
+                //        halide_qurt_hvx_lock();
+                //     }
+                //   }
+                //   vector code
+                //   halide_qurt_unlock
+                // }
+                s = For::make(op->name, op->min, op->extent, op->for_type, op->device_api, body);
+            }
+
+            uses_hvx = old_uses_hvx;
+            return s;
+
+        }
+        return IRMutator2::visit(op);
+    }
+    Expr visit(const Variable *op) {
+        uses_hvx = uses_hvx || op->type.is_vector();
+        return op;
+    }
+    Expr visit(const Ramp *op) {
+        uses_hvx = uses_hvx || op->type.is_vector();
+        return op;
+    }
+    Expr visit(const Broadcast *op) {
+        uses_hvx = uses_hvx || op->lanes > 1;
+        return op;
+    }
+    Expr visit(const Call *op) {
+        uses_hvx = uses_hvx || op->type.is_vector();
+        return op;
+    }
+
+    Target target;
+};
+
+Stmt inject_hvx_lock_unlock(Stmt body, const Target &target) {
+    InjectHVXLocks i(target);
+    body = i.mutate(body);
+    if (i.uses_hvx) {
+        body = acquire_hvx_context(body, target);
+    }
+    body = substitute("uses_hvx", i.uses_hvx, body);
+    body = simplify(body);
+    return body;
+}
+
+}// namespace
+
+void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
+                                   const string &simple_name, const string &extern_name) {
+    CodeGen_Posix::begin_func(f.linkage, simple_name, extern_name, f.args);
+
+    Stmt body = f.body;
+
+    debug(1) << "Unpredicating loads and stores...\n";
+    // Before running unpredicate_loads_stores, replace dense vector
+    // predicated loads with sloppy scalarized predicates.
+    body = sloppy_unpredicate_loads(body);
+    body = unpredicate_loads_stores(body);
+    debug(2) << "Lowering after unpredicating loads/stores:\n" << body << "\n\n";
+
+    debug(1) << "Optimizing shuffles...\n";
+    // vlut always indexes 64 bytes of the LUT at a time, even in 128 byte mode.
+    const int lut_alignment = 64;
+    body = optimize_hexagon_shuffles(body, lut_alignment);
+    debug(2) << "Lowering after optimizing shuffles:\n" << body << "\n\n";
+
+    // Generating vtmpy before CSE and align_loads makes it easier to match
+    // patterns for vtmpy.
+    #if 0
+    // TODO(aankit): Re-enable this after fixing complexity issue.
+    debug(1) << "Generating vtmpy...\n";
+    body = vtmpy_generator(body);
+    debug(2) << "Lowering after generating vtmpy:\n" << body << "\n\n";
+    #endif
+
+    debug(1) << "Aligning loads for HVX....\n";
+    body = align_loads(body, target.natural_vector_size(Int(8)), alignment_info);
+    body = common_subexpression_elimination(body);
+    // Don't simplify here, otherwise it will re-collapse the loads we
+    // want to carry across loop iterations.
+    debug(2) << "Lowering after aligning loads:\n" << body << "\n\n";
+
+    debug(1) << "Carrying values across loop iterations...\n";
+    // Use at most 16 vector registers for carrying values.
+    body = loop_carry(body, 16);
+    body = simplify(body);
+    debug(2) << "Lowering after forwarding stores:\n" << body << "\n\n";
+
+    // We can't deal with bool vectors, convert them to integer vectors.
+    debug(1) << "Eliminating boolean vectors from Hexagon code...\n";
+    body = eliminate_bool_vectors(body);
+    debug(2) << "Lowering after eliminating boolean vectors: " << body << "\n\n";
+
+    // Optimize the IR for Hexagon.
+    debug(1) << "Optimizing Hexagon instructions...\n";
+    body = optimize_hexagon_instructions(body, target);
+
+    debug(1) << "Adding calls to qurt_hvx_lock, if necessary...\n";
+    body = inject_hvx_lock_unlock(body, target);
+
+    debug(1) << "Hexagon function body:\n";
+    debug(1) << body << "\n";
+
+    body.accept(this);
+
+    CodeGen_Posix::end_func(f.args);
+}
+
+void CodeGen_Hexagon::init_module() {
+    CodeGen_Posix::init_module();
+
+    bool is_128B = target.has_feature(Halide::Target::HVX_128);
+
+    Type i8 = Int(8);
+    Type i16 = Int(16);
+    Type i32 = Int(32);
+    Type u8 = UInt(8);
+    Type u16 = UInt(16);
+    Type u32 = UInt(32);
+
+    // Define vectors that are 1x and 2x the Hexagon HVX width.
+    Type i8v1 = i8.with_lanes(native_vector_bits() / 8);
+    Type i16v1 = i16.with_lanes(native_vector_bits() / 16);
+    Type i32v1 = i32.with_lanes(native_vector_bits() / 32);
+    Type u8v1 = u8.with_lanes(native_vector_bits() / 8);
+    Type u16v1 = u16.with_lanes(native_vector_bits() / 16);
+    Type u32v1 = u32.with_lanes(native_vector_bits() / 32);
+
+    Type i8v2 = i8v1.with_lanes(i8v1.lanes() * 2);
+    Type i16v2 = i16v1.with_lanes(i16v1.lanes() * 2);
+    Type i32v2 = i32v1.with_lanes(i32v1.lanes() * 2);
+    Type u8v2 = u8v1.with_lanes(u8v1.lanes() * 2);
+    Type u16v2 = u16v1.with_lanes(u16v1.lanes() * 2);
+    Type u32v2 = u32v1.with_lanes(u32v1.lanes() * 2);
+
+    // LLVM's HVX vector intrinsics don't include the type of the
+    // operands, they all operate on vectors of 32 bit integers. To make
+    // it easier to generate code, we define wrapper intrinsics with
+    // the correct type (plus the necessary bitcasts).
+    struct HvxIntrinsic {
+        enum {
+            BroadcastScalarsToWords = 1 << 0,  // Some intrinsics need scalar arguments broadcasted up to 32 bits.
+        };
+        Intrinsic::ID id;
+        Type ret_type;
+        const char *name;
+        vector<Type> arg_types;
+        int flags;
+    };
+    vector<HvxIntrinsic> intrinsic_wrappers = {
+        // Zero/sign extension:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vzb), u16v2,  "zxt.vub", {u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vzh), u32v2,  "zxt.vuh", {u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsb), i16v2,  "sxt.vb",  {i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsh), i32v2,  "sxt.vh",  {i16v1} },
+
+        // Similar to zxt/sxt, but without deinterleaving the result.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vunpackub), u16v2, "unpack.vub", {u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vunpackuh), u32v2, "unpack.vuh", {u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vunpackb),  i16v2, "unpack.vb",  {i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vunpackh),  i32v2, "unpack.vh",  {i16v1} },
+
+        // Truncation:
+        // (Yes, there really are two fs in the b versions, and 1 f in
+        // the h versions.)
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vshuffeb), i8v1,  "trunc.vh",  {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vshufeh),  i16v1, "trunc.vw",  {i32v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vshuffob), i8v1,  "trunclo.vh",  {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vshufoh),  i16v1, "trunclo.vw",  {i32v2} },
+
+        // Downcast with saturation:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsathub),  u8v1,  "trunc_satub.vh",  {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsatwh),   i16v1, "trunc_sath.vw",   {i32v2} },
+#if LLVM_VERSION >= 50
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsatuwuh), u16v1, "trunc_satuh.vuw",   {u32v2} },    // v62 or later
+#endif
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vroundhub), u8v1,  "trunc_satub_rnd.vh", {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vroundhb),  i8v1,  "trunc_satb_rnd.vh",  {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vroundwuh), u16v1, "trunc_satuh_rnd.vw", {i32v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vroundwh),  i16v1, "trunc_sath_rnd.vw",  {i32v2} },
+
+        // vpack does not interleave its input.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackhub_sat), u8v1,  "pack_satub.vh", {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackwuh_sat), u16v1, "pack_satuh.vw", {i32v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackhb_sat),  i8v1,  "pack_satb.vh",  {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackwh_sat),  i16v1, "pack_sath.vw",  {i32v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackeb),      i8v1,  "pack.vh",       {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackeh),      i16v1, "pack.vw",       {i32v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackob),      i8v1,  "packhi.vh",     {i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpackoh),      i16v1, "packhi.vw",     {i32v2} },
+
+
+        // Adds/subtracts:
+        // Note that we just use signed arithmetic for unsigned
+        // operands, because it works with two's complement arithmetic.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddb),     i8v1,  "add.vb.vb",     {i8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddh),     i16v1, "add.vh.vh",     {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddw),     i32v1, "add.vw.vw",     {i32v1, i32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddb_dv),  i8v2,  "add.vb.vb.dv",  {i8v2,  i8v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddh_dv),  i16v2, "add.vh.vh.dv",  {i16v2, i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddw_dv),  i32v2, "add.vw.vw.dv",  {i32v2, i32v2} },
+
+        // Widening adds. There are other instructions that add two vub and two vuh but do not widen.
+        // To differentiate those from the widening ones, we encode the return type in the name here.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddubh), u16v2, "add_vuh.vub.vub", {u8v1, u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddhw), i32v2, "add_vw.vh.vh", {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vadduhw), u32v2, "add_vuw.vuh.vuh", {u16v1, u16v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubb),     i8v1,  "sub.vb.vb",     {i8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubh),     i16v1, "sub.vh.vh",     {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubw),     i32v1, "sub.vw.vw",     {i32v1, i32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubb_dv),  i8v2,  "sub.vb.vb.dv",  {i8v2,  i8v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubh_dv),  i16v2, "sub.vh.vh.dv",  {i16v2, i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubw_dv),  i32v2, "sub.vw.vw.dv",  {i32v2, i32v2} },
+
+        // Widening subtracts. There are other instructions that subtact two vub and two vuh but do not widen.
+        // To differentiate those from the widening ones, we encode the return type in the name here.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsububh), u16v2, "sub_vuh.vub.vub", {u8v1, u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsububh), i16v2, "sub_vh.vub.vub", {u8v1, u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubhw), i32v2, "sub_vw.vh.vh", {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubuhw), u32v2, "sub_vuw.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubuhw), i32v2, "sub_vw.vuh.vuh", {u16v1, u16v1} },
+
+
+        // Adds/subtract of unsigned values with saturation.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddubsat),    u8v1,  "satub_add.vub.vub",    {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vadduhsat),    u16v1, "satuh_add.vuh.vuh",    {u16v1, u16v1} },
+#if LLVM_VERSION >= 50
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vadduwsat),    u32v1, "satuw_add.vuw.vuw",    {u32v1, u32v1} },  // v62 or later
+#endif
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddhsat),     i16v1, "sath_add.vh.vh",       {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddwsat),     i32v1, "satw_add.vw.vw",       {i32v1, i32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddubsat_dv), u8v2,  "satub_add.vub.vub.dv", {u8v2,  u8v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vadduhsat_dv), u16v2, "satuh_add.vuh.vuh.dv", {u16v2, u16v2} },
+#if LLVM_VERSION >= 50
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vadduwsat_dv), u32v2, "satuw_add.vuw.vuw.dv", {u32v2, u32v2} },  // v62 or later
+#endif
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddhsat_dv),  i16v2, "sath_add.vh.vh.dv",    {i16v2, i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaddwsat_dv),  i32v2, "satw_add.vw.vw.dv",    {i32v2, i32v2} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsububsat),    u8v1,  "satub_sub.vub.vub",    {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubuhsat),    u16v1, "satuh_sub.vuh.vuh",    {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubhsat),     i16v1, "sath_sub.vh.vh",       {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubwsat),     i32v1, "satw_sub.vw.vw",       {i32v1, i32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsububsat_dv), u8v2,  "satub_sub.vub.vub.dv", {u8v2,  u8v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubuhsat_dv), u16v2, "satuh_sub.vuh.vuh.dv", {u16v2, u16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubhsat_dv),  i16v2, "sath_sub.vh.vh.dv",    {i16v2, i16v2} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vsubwsat_dv),  i32v2, "satw_sub.vw.vw.dv",    {i32v2, i32v2} },
+
+        // Absolute value:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsh),   u16v1, "abs.vh", {i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsw),   u32v1, "abs.vw", {i32v1} },
+
+        // Absolute difference:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsdiffub),  u8v1,  "absd.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsdiffuh),  u16v1, "absd.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsdiffh),   u16v1, "absd.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsdiffw),   u32v1, "absd.vw.vw",   {i32v1, i32v1} },
+
+        // Averaging:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavgub), u8v1,  "avg.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavguh), u16v1, "avg.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavgh),  i16v1, "avg.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavgw),  i32v1, "avg.vw.vw",   {i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavgubrnd), u8v1,  "avg_rnd.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavguhrnd), u16v1, "avg_rnd.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavghrnd),  i16v1, "avg_rnd.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavgwrnd),  i32v1, "avg_rnd.vw.vw",   {i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnavgub), i8v1,  "navg.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnavgh),  i16v1, "navg.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnavgw),  i32v1, "navg.vw.vw",   {i32v1, i32v1} },
+
+        // Non-widening multiplication:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyih),  i16v1, "mul.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyihb), i16v1, "mul.vh.b",    {i16v1, i8}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyiwh), i32v1, "mul.vw.h",    {i32v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyiwb), i32v1, "mul.vw.b",    {i32v1, i8}, HvxIntrinsic::BroadcastScalarsToWords },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyih_acc),  i16v1, "add_mul.vh.vh.vh",   {i16v1, i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyihb_acc), i16v1, "add_mul.vh.vh.b",    {i16v1, i16v1, i8}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyiwh_acc), i32v1, "add_mul.vw.vw.h",    {i32v1, i32v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyiwb_acc), i32v1, "add_mul.vw.vw.b",    {i32v1, i32v1, i8}, HvxIntrinsic::BroadcastScalarsToWords },
+
+        // Widening vector multiplication:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyubv), u16v2, "mpy.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyuhv), u32v2, "mpy.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpybv),  i16v2, "mpy.vb.vb",   {i8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhv),  i32v2, "mpy.vh.vh",   {i16v1, i16v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyubv_acc), u16v2, "add_mpy.vuh.vub.vub", {u16v2, u8v1, u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyuhv_acc), u32v2, "add_mpy.vuw.vuh.vuh", {u32v2, u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpybv_acc),  i16v2, "add_mpy.vh.vb.vb",    {i16v2, i8v1, i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhv_acc),  i32v2, "add_mpy.vw.vh.vh",    {i32v2, i16v1, i16v1} },
+
+        // Inconsistencies: both are vector instructions despite the
+        // missing 'v', and the signedness is indeed swapped.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpybusv), i16v2, "mpy.vub.vb",  {u8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhus),  i32v2, "mpy.vh.vuh",  {i16v1, u16v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpybusv_acc), i16v2, "add_mpy.vh.vub.vb",  {i16v2, u8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhus_acc),  i32v2, "add_mpy.vw.vh.vuh",  {i32v2, i16v1, u16v1} },
+
+        // Widening scalar multiplication:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyub),  u16v2, "mpy.vub.ub",  {u8v1,  u8}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyuh),  u32v2, "mpy.vuh.uh",  {u16v1, u16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyh),   i32v2, "mpy.vh.h",    {i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpybus), i16v2, "mpy.vub.b",   {u8v1,  i8}, HvxIntrinsic::BroadcastScalarsToWords },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyub_acc),   u16v2, "add_mpy.vuh.vub.ub",   {u16v2, u8v1,  u8}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyuh_acc),   u32v2, "add_mpy.vuw.vuh.uh",   {u32v2, u16v1, u16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpybus_acc),  i16v2, "add_mpy.vh.vub.b",     {i16v2, u8v1,  i8}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhsat_acc), i32v2, "satw_add_mpy.vw.vh.h", {i32v2, i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+
+        // Widening vector multiplication, with horizontal reduction.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpyubv),  u32v1, "add_4mpy.vub.vub", {u8v1, u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpybv),   i32v1, "add_4mpy.vb.vb",   {i8v1, i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpybusv), i32v1, "add_4mpy.vub.vb",  {i8v1, i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpyubv_acc),  u32v1, "acc_add_4mpy.vuw.vub.vub", {u32v1, u8v1, u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpybv_acc),   i32v1, "acc_add_4mpy.vw.vb.vb",   {i32v1, i8v1, i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpybusv_acc), i32v1, "acc_add_4mpy.vw.vub.vb",  {i32v1, i8v1, i8v1} },
+
+        // Widening scalar multiplication, with horizontal reduction.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vdmpybus), i16v1, "add_2mpy.vub.b", {u8v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vdmpyhb),  i32v1, "add_2mpy.vh.b",  {i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vdmpybus_acc), i16v1, "acc_add_2mpy.vh.vub.b", {i16v1, u8v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vdmpyhb_acc),  i32v1, "acc_add_2mpy.vw.vh.b",  {i32v1, i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+
+        // TODO: There are also saturating versions of vdmpy.
+
+        // TODO: These don't generate correctly because the vectors
+        // aren't interleaved correctly.
+        //{ IPICK(is_128B, Intrinsic::hexagon_V6_vdmpybus_dv), i16v2, "add_2mpy.vub.b.dv", {u8v2, i32} },
+        //{ IPICK(is_128B, Intrinsic::hexagon_V6_vdmpyhb_dv), i32v2, "add_2mpy.vh.b.dv", {i16v2, i32} },
+        //{ IPICK(is_128B, Intrinsic::hexagon_V6_vdmpybus_dv_acc), i16v2, "acc_add_2mpy.vh.vub.b.dv", {i16v2, u8v2, i32} },
+        //{ IPICK(is_128B, Intrinsic::hexagon_V6_vdmpyhb_dv_acc), i32v2, "acc_add_2mpy.vw.vh.b.dv", {i32v2, i16v2, i32} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpybus), i32v1, "add_4mpy.vub.b",  {u8v1, i32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpyub),  u32v1, "add_4mpy.vub.ub", {u8v1, u32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpybus_acc), i32v1, "acc_add_4mpy.vw.vub.b",  {i32v1, u8v1, i32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vrmpyub_acc),  u32v1, "acc_add_4mpy.vuw.vub.ub", {u32v1, u8v1, u32} },
+
+        // Multiply keep high half, with multiplication by 2.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhvsrs), i16v1, "trunc_satw_mpy2_rnd.vh.vh", {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhss), i16v1, "trunc_satw_mpy2.vh.h", {i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyhsrs), i16v1, "trunc_satw_mpy2_rnd.vh.h", {i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords },
+
+        // Select/conditionals. Conditions are always signed integer
+        // vectors (so widening sign extends).
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmux), i8v1,  "mux.vb.vb",  {i8v1,  i8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmux), i16v1, "mux.vh.vh",  {i16v1, i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmux), i32v1, "mux.vw.vw",  {i32v1, i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_veqb), i8v1,  "eq.vb.vb",  {i8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_veqh), i16v1, "eq.vh.vh",  {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_veqw), i32v1, "eq.vw.vw",  {i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vgtub), i8v1,  "gt.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vgtuh), i16v1, "gt.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vgtuw), i32v1, "gt.vuw.vuw", {u32v1, u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vgtb),  i8v1,  "gt.vb.vb",   {i8v1,  i8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vgth),  i16v1, "gt.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vgtw),  i32v1, "gt.vw.vw",   {i32v1, i32v1} },
+
+        // Min/max:
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmaxub), u8v1,  "max.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmaxuh), u16v1, "max.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmaxh),  i16v1, "max.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vmaxw),  i32v1, "max.vw.vw",   {i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vminub), u8v1,  "min.vub.vub", {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vminuh), u16v1, "min.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vminh),  i16v1, "min.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vminw),  i32v1, "min.vw.vw",   {i32v1, i32v1} },
+
+        // Shifts
+        // We map arithmetic and logical shifts to just "shr", depending on type.
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vlsrhv), u16v1, "shr.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vlsrwv), u32v1, "shr.vuw.vuw", {u32v1, u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrhv), i16v1, "shr.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrwv), i32v1, "shr.vw.vw",   {i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslhv), u16v1, "shl.vuh.vuh", {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslwv), u32v1, "shl.vuw.vuw", {u32v1, u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslhv), i16v1, "shl.vh.vh",   {i16v1, i16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslwv), i32v1, "shl.vw.vw",   {i32v1, i32v1} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vlsrh),  u16v1, "shr.vuh.uh", {u16v1, u16} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vlsrw),  u32v1, "shr.vuw.uw", {u32v1, u32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrh),  i16v1, "shr.vh.h",   {i16v1, i16} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrw),  i32v1, "shr.vw.w",   {i32v1, i32} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslh),  u16v1, "shl.vuh.uh", {u16v1, u16} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslw),  u32v1, "shl.vuw.uw", {u32v1, u32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslh),  i16v1, "shl.vh.h",   {i16v1, i16} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslw),  i32v1, "shl.vw.w",   {i32v1, i32} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrw_acc), i32v1, "add_shr.vw.vw.w", {i32v1, i32v1, i32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslw_acc), i32v1, "add_shl.vw.vw.w", {i32v1, i32v1, i32} },
+
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrwh), i16v1, "trunc_shr.vw.w",   {i32v2, i32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrhubsat), u8v1, "trunc_satub_shr.vh.h",  {i16v2, i16} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrwuhsat), u16v1, "trunc_satuh_shr.vw.w", {i32v2, i32} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrwhsat),  i16v1, "trunc_sath_shr.vw.w",  {i32v2, i32} },
+
+        // Bitwise operators
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vand),  u8v1,  "and.vb.vb",  {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vand),  u16v1, "and.vh.vh",  {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vand),  u32v1, "and.vw.vw",  {u32v1, u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vor),   u8v1,  "or.vb.vb",   {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vor),   u16v1, "or.vh.vh",   {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vor),   u32v1, "or.vw.vw",   {u32v1, u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vxor),  u8v1,  "xor.vb.vb",  {u8v1,  u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vxor),  u16v1, "xor.vh.vh",  {u16v1, u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vxor),  u32v1, "xor.vw.vw",  {u32v1, u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnot),  u8v1,  "not.vb",     {u8v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnot),  u16v1, "not.vh",     {u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnot),  u32v1, "not.vw",     {u32v1} },
+
+        // Broadcasts
+#if LLVM_VERSION >= 50
+        { IPICK(is_128B, Intrinsic::hexagon_V6_lvsplatb), u8v1,   "splat_v62.b", {u8}  },   // v62 or later
+        { IPICK(is_128B, Intrinsic::hexagon_V6_lvsplath), u16v1,  "splat_v62.h", {u16} },   // v62 or later
+#endif
+        { IPICK(is_128B, Intrinsic::hexagon_V6_lvsplatw), u32v1,  "splat.w", {u32} },
+
+        // Bit counting
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vcl0h), u16v1, "clz.vh", {u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vcl0w), u32v1, "clz.vw", {u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnormamth), u16v1, "cls.vh", {u16v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vnormamtw), u32v1, "cls.vw", {u32v1} },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vpopcounth), u16v1, "popcount.vh", {u16v1} },
+        // TODO: If we need it, we could implement a popcountw in the
+        // runtime module that uses popcounth, and horizontally add
+        // each pair of lanes.
+    };
+    // TODO: Many variants of the above functions are missing. They
+    // need to be implemented in the runtime module, or via
+    // fall-through to CodeGen_LLVM.
+    for (HvxIntrinsic &i : intrinsic_wrappers) {
+        define_hvx_intrinsic(i.id, i.ret_type, i.name, i.arg_types,
+                             i.flags & HvxIntrinsic::BroadcastScalarsToWords);
+    }
+}
+
+llvm::Function *CodeGen_Hexagon::define_hvx_intrinsic(int id, Type ret_ty, const string &name,
+                                                      const vector<Type> &arg_types, bool broadcast_scalar_word) {
+    internal_assert(id != Intrinsic::not_intrinsic);
+    // Get the real intrinsic.
+    llvm::Function *intrin = Intrinsic::getDeclaration(module.get(), (llvm::Intrinsic::ID)id);
+    return define_hvx_intrinsic(intrin, ret_ty, name, arg_types, broadcast_scalar_word);
+}
+
+llvm::Function *CodeGen_Hexagon::define_hvx_intrinsic(llvm::Function *intrin, Type ret_ty, const string &name,
+                                                      vector<Type> arg_types, bool broadcast_scalar_word) {
+    internal_assert(intrin) << "Null definition for intrinsic '" << name << "'\n";
+    llvm::FunctionType *intrin_ty = intrin->getFunctionType();
+
+    // Get the types of the arguments we want to pass.
+    vector<llvm::Type *> llvm_arg_types;
+    llvm_arg_types.reserve(arg_types.size());
+    for (Type i : arg_types) {
+        llvm_arg_types.push_back(llvm_type_of(i));
+    }
+
+    // Make a wrapper intrinsic.
+    llvm::FunctionType *wrapper_ty =
+        llvm::FunctionType::get(llvm_type_of(ret_ty), llvm_arg_types, false);
+    llvm::Function *wrapper =
+        llvm::Function::Create(wrapper_ty, llvm::GlobalValue::InternalLinkage,
+                               "halide.hexagon." + name, module.get());
+    llvm::BasicBlock *block = llvm::BasicBlock::Create(module->getContext(), "entry", wrapper);
+    IRBuilderBase::InsertPoint here = builder->saveIP();
+    builder->SetInsertPoint(block);
+
+    vector<Value *> args;
+    for (Value &arg : wrapper->args()) {
+        args.push_back(&arg);
+    }
+
+    if (args.size() + 1 == intrin_ty->getNumParams()) {
+        // This intrinsic needs the first argument split into the high and low vectors.
+        Value *dv = args[0];
+        int vec_lanes = native_vector_bits()/arg_types[0].bits();
+        Value *low = slice_vector(dv, 0, vec_lanes);
+        Value *high = slice_vector(dv, vec_lanes, vec_lanes);
+
+        args[0] = high;
+        args.insert(args.begin() + 1, low);
+
+        Type split_type = arg_types.front().with_lanes(arg_types.front().lanes() / 2);
+        arg_types[0] = split_type;
+        arg_types.insert(arg_types.begin() + 1, split_type);
+    }
+
+    // Replace args with bitcasts if necessary.
+    internal_assert(args.size() == intrin_ty->getNumParams());
+    for (size_t i = 0; i < args.size(); i++) {
+        llvm::Type *arg_ty = intrin_ty->getParamType(i);
+        if (args[i]->getType() != arg_ty) {
+            if (arg_ty->isVectorTy()) {
+                args[i] = builder->CreateBitCast(args[i], arg_ty);
+            } else {
+                if (broadcast_scalar_word) {
+                    llvm::Function *fn = nullptr;
+                    // We know it is a scalar type. We can have 8 bit, 16 bit or 32 bit types only.
+                    unsigned bits = arg_types[i].bits();
+                    switch(bits) {
+                    case 8:
+                        fn = module->getFunction("halide.hexagon.dup4.b");
+                        break;
+                    case 16:
+                        fn = module->getFunction("halide.hexagon.dup2.h");
+                        break;
+                    default:
+                        internal_error << "unhandled broadcast_scalar_word in define_hvx_intrinsic";
+                    }
+                    args[i] = builder->CreateCall(fn, { args[i] });
+                } else if (args[i]->getType()->isIntegerTy()) {
+                    args[i] = builder->CreateIntCast(args[i], arg_ty, arg_types[i].is_int());
+                } else {
+                    args[i] = builder->CreateBitCast(args[i], arg_ty);
+                }
+            }
+        }
+    }
+
+    // Call the real intrinsic.
+    Value *ret = builder->CreateCall(intrin, args);
+
+    // Cast the result, if necessary.
+    if (ret->getType() != wrapper_ty->getReturnType()) {
+        ret = builder->CreateBitCast(ret, wrapper_ty->getReturnType());
+    }
+
+    builder->CreateRet(ret);
+
+    // Always inline these wrappers.
+    wrapper->addFnAttr(llvm::Attribute::AlwaysInline);
+
+    builder->restoreIP(here);
+
+    llvm::verifyFunction(*wrapper);
+    return wrapper;
+}
+
+Value *CodeGen_Hexagon::create_bitcast(Value *v, llvm::Type *ty) {
+    if (BitCastInst *c = dyn_cast<BitCastInst>(v)) {
+        return create_bitcast(c->getOperand(0), ty);
+    } else if (isa<UndefValue>(v)) {
+        return UndefValue::get(ty);
+    } else if (v->getType() != ty) {
+        v = builder->CreateBitCast(v, ty);
+    }
+    return v;
+}
+
+Value *CodeGen_Hexagon::call_intrin_cast(llvm::Type *ret_ty,
+                                         llvm::Function *F,
+                                         vector<Value *> Ops) {
+    llvm::FunctionType *FType = F->getFunctionType();
+    internal_assert(FType->getNumParams() == Ops.size());
+    for (unsigned I = 0; I < FType->getNumParams(); ++I) {
+        Ops[I] = create_bitcast(Ops[I], FType->getParamType(I));
+    }
+    Value *ret = builder->CreateCall(F, Ops);
+    return create_bitcast(ret, ret_ty);
+}
+
+Value *CodeGen_Hexagon::call_intrin_cast(llvm::Type *ret_ty,
+                                         int id,
+                                         vector<Value *> Ops) {
+    llvm::Function *intrin = Intrinsic::getDeclaration(module.get(), (llvm::Intrinsic::ID)id);
+    return call_intrin_cast(ret_ty, intrin, Ops);
+}
+
+Value *CodeGen_Hexagon::interleave_vectors(const vector<llvm::Value *> &v) {
+    bool is_128B = target.has_feature(Halide::Target::HVX_128);
+    llvm::Type *v_ty = v[0]->getType();
+    llvm::Type *element_ty = v_ty->getVectorElementType();
+    int element_bits = element_ty->getScalarSizeInBits();
+    int native_elements = native_vector_bits()/element_ty->getScalarSizeInBits();
+    int result_elements = v_ty->getVectorNumElements()*v.size();
+    if (v.size() == 2) {
+        // Interleaving two vectors.
+        Value *a = v[0];
+        Value *b = v[1];
+
+        if (result_elements == native_elements && (element_bits == 8 || element_bits == 16)) {
+            llvm::Type *native_ty = llvm::VectorType::get(element_ty, native_elements);
+            // This is an interleave of two half native vectors, use
+            // vshuff.
+            Intrinsic::ID vshuff =
+                element_bits == 8 ? IPICK(is_128B, Intrinsic::hexagon_V6_vshuffb) : IPICK(is_128B, Intrinsic::hexagon_V6_vshuffh);
+            return call_intrin_cast(native_ty, vshuff, {concat_vectors({a, b})});
+        } else {
+            // Break them into native vectors, use vshuffvdd, and
+            // concatenate the shuffled results.
+            llvm::Type *native2_ty = llvm::VectorType::get(element_ty, native_elements*2);
+            Value *bytes = codegen(-static_cast<int>(element_bits/8));
+            vector<Value *> ret;
+            for (int i = 0; i < result_elements/2; i += native_elements) {
+                Value *a_i = slice_vector(a, i, native_elements);
+                Value *b_i = slice_vector(b, i, native_elements);
+                Value *ret_i = call_intrin_cast(native2_ty,
+                                                IPICK(is_128B, Intrinsic::hexagon_V6_vshuffvdd),
+                                                {b_i, a_i, bytes});
+                if ((i + native_elements)*2 > result_elements) {
+                    // This is the last vector, and it has some extra
+                    // elements. Slice it down.
+                    ret_i = slice_vector(ret_i, 0, (i + native_elements)*2 - result_elements);
+                }
+                ret.push_back(ret_i);
+            }
+            return concat_vectors(ret);
+        }
+    } else if (v.size() == 3) {
+        // Interleaving 3 vectors - this generates awful code if we let LLVM do it,
+        // so we use vdelta.
+        Value *lut = concat_vectors(v);
+
+        std::vector<int> indices;
+        for (unsigned i = 0; i < v_ty->getVectorNumElements(); i++) {
+            for (size_t j = 0; j < v.size(); j++) {
+                indices.push_back(j * v_ty->getVectorNumElements() + i);
+            }
+        }
+
+        return vdelta(lut, indices);
+    }
+    return CodeGen_Posix::interleave_vectors(v);
+}
+
+namespace {
+
+// Check if indices form a strided ramp, allowing undef elements to
+// pretend to be part of the ramp.
+bool is_strided_ramp(const vector<int> &indices, int &start, int &stride) {
+    int size = static_cast<int>(indices.size());
+
+    // To find the proposed start and stride, find two non-undef elements.
+    int x0 = -1;
+    int x1 = -1;
+    for (int i = 0; i < size; i++) {
+        if (indices[i] != -1) {
+            if (x0 == -1) {
+                x0 = i;
+            } else {
+                x1 = i;
+                break;
+            }
+        }
+    }
+
+    if (x1 == -1) {
+        // If we don't have enough non-undef elements, we can pretend
+        // the ramp is anything we want!
+        stride = 1;
+        start = x0 != -1 ? indices[x0] - x0 : 0;
+        return true;
+    }
+
+    int dx = x1 - x0;
+    int dy = indices[x1] - indices[x0];
+    stride = dy/dx;
+    start = indices[x0] - stride*x0;
+
+    // Verify that all of the non-undef elements are part of the strided ramp.
+    for (int i = 0; i < size; i++) {
+        if (indices[i] != -1 && indices[i] != start + i*stride) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_concat_or_slice(const vector<int> &indices) {
+    // Skip undef elements at the beginning and the end.
+    size_t begin = 0;
+    while (begin < indices.size() && indices[begin] == -1) {
+        ++begin;
+    }
+    size_t end = indices.size();
+    while (end > 1 && indices[end - 1] == -1) {
+        --end;
+    }
+
+    // Check that the remaining elements are a dense ramp.
+    for (size_t i = begin; i + 1 < end; i++) {
+        if (indices[i] + 1 != indices[i + 1]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+}  // namespace
+
+Value *CodeGen_Hexagon::shuffle_vectors(Value *a, Value *b,
+                                        const vector<int> &indices) {
+    llvm::Type *a_ty = a->getType();
+    llvm::Type *b_ty = b->getType();
+    internal_assert(a_ty == b_ty);
+
+    bool is_128B = target.has_feature(Halide::Target::HVX_128);
+    int a_elements = static_cast<int>(a_ty->getVectorNumElements());
+    int b_elements = static_cast<int>(b_ty->getVectorNumElements());
+
+    llvm::Type *element_ty = a->getType()->getVectorElementType();
+    internal_assert(element_ty);
+    int element_bits = element_ty->getScalarSizeInBits();
+    int native_elements = native_vector_bits() / element_bits;
+    llvm::Type *native_ty = llvm::VectorType::get(element_ty, native_elements);
+    llvm::Type *native2_ty = llvm::VectorType::get(element_ty, native_elements*2);
+
+    int result_elements = static_cast<int>(indices.size());
+    internal_assert(result_elements > 0);
+    llvm::Type *result_ty = VectorType::get(element_ty, result_elements);
+
+    // Try to rewrite shuffles that only access the elements of b.
+    int min = indices[0];
+    for (size_t i = 1; i < indices.size(); i++) {
+        if (indices[i] != -1 && indices[i] < min) {
+            min = indices[i];
+        }
+    }
+    if (min >= a_elements) {
+        vector<int> shifted_indices(indices);
+        for (int &i : shifted_indices) {
+            if (i != -1) i -= a_elements;
+        }
+        return shuffle_vectors(b, UndefValue::get(b->getType()), shifted_indices);
+    }
+
+    // Try to rewrite shuffles that only access the elements of a.
+    int max = *std::max_element(indices.begin(), indices.end());
+    if (max < a_elements) {
+        BitCastInst *a_cast = dyn_cast<BitCastInst>(a);
+        CallInst *a_call = dyn_cast<CallInst>(a_cast ? a_cast->getOperand(0) : a);
+        llvm::Function *vcombine =
+            Intrinsic::getDeclaration(module.get(), IPICK(is_128B, Intrinsic::hexagon_V6_vcombine));
+        if (a_call && a_call->getCalledFunction() == vcombine) {
+            // Rewrite shuffle(vcombine(a, b), x) to shuffle(a, b)
+            return shuffle_vectors(
+                create_bitcast(a_call->getArgOperand(1), native_ty),
+                create_bitcast(a_call->getArgOperand(0), native_ty),
+                indices);
+        } else if (ShuffleVectorInst *a_shuffle = dyn_cast<ShuffleVectorInst>(a)) {
+            bool is_identity = true;
+            for (int i = 0; i < a_elements; i++) {
+                int mask_i = a_shuffle->getMaskValue(i);
+                is_identity = is_identity && (mask_i == i || mask_i == -1);
+            }
+            if (is_identity) {
+                return shuffle_vectors(
+                    a_shuffle->getOperand(0),
+                    a_shuffle->getOperand(1),
+                    indices);
+            }
+        }
+    }
+
+    // Try to rewrite shuffles of (maybe strided) ramps.
+    int start = 0, stride = 0;
+    if (!is_strided_ramp(indices, start, stride)) {
+        if (is_concat_or_slice(indices) || element_bits > 16) {
+            // Let LLVM handle concat or slices.
+            return CodeGen_Posix::shuffle_vectors(a, b, indices);
+        }
+        return vlut(concat_vectors({a, b}), indices);
+    }
+
+    if (stride == 1) {
+        if (result_ty == native2_ty && a_ty == native_ty && b_ty == native_ty) {
+            // This is a concatenation of a and b, where a and b are
+            // native vectors. Use vcombine.
+            internal_assert(start == 0);
+            return call_intrin_cast(native2_ty, IPICK(is_128B, Intrinsic::hexagon_V6_vcombine), {b, a});
+        }
+        if (result_ty == native_ty && a_ty == native2_ty && max < a_elements) {
+            // Extract a and b from a double vector.
+            b = call_intrin_cast(native_ty, IPICK(is_128B, Intrinsic::hexagon_V6_hi), {a});
+            a = call_intrin_cast(native_ty, IPICK(is_128B, Intrinsic::hexagon_V6_lo), {a});
+            a_ty = a->getType();
+            b_ty = b->getType();
+            a_elements = a_ty->getVectorNumElements();
+            b_elements = b_ty->getVectorNumElements();
+        }
+        if (start == 0 && result_ty == a_ty) {
+            return a;
+        }
+        if (start == a_elements && result_ty == b_ty) {
+            return b;
+        }
+        if (result_ty == native_ty && a_ty == native_ty && b_ty == native_ty) {
+            // Use valign to select a subset of the concatenation of a
+            // and b.
+            int bytes_off = start * (element_bits / 8);
+            int reverse_bytes = (native_vector_bits() / 8) - bytes_off;
+            Intrinsic::ID intrin_id = IPICK(is_128B, Intrinsic::hexagon_V6_valignb);
+            // v(l)align is a bit more efficient if the offset fits in
+            // 3 bits, so if the offset is with in 3 bits from the
+            // high end, use vlalign instead.
+            if (bytes_off <= 7) {
+                intrin_id = IPICK(is_128B, Intrinsic::hexagon_V6_valignbi);
+            } else if (reverse_bytes <= 7) {
+                intrin_id = IPICK(is_128B, Intrinsic::hexagon_V6_vlalignbi);
+                bytes_off = reverse_bytes;
+            }
+            return call_intrin_cast(native_ty, intrin_id, {b, a, codegen(bytes_off)});
+        }
+        return CodeGen_Posix::shuffle_vectors(a, b, indices);
+    } else if (stride == 2 && result_elements*2 == a_elements + b_elements) {
+        internal_assert(start == 0 || start == 1);
+        // For stride 2 shuffles, we can use vpack or vdeal.
+        // It's hard to use call_intrin here. We'll just slice and
+        // concat manually.
+        Value *ab = max < a_elements ? a : concat_vectors({a, b});
+        vector<Value *> ret;
+        for (int i = 0; i < result_elements; i += native_elements) {
+            Value *ab_i0 = slice_vector(ab, i*2, native_elements);
+            Value *ab_i1 = slice_vector(ab, i*2 + native_elements, native_elements);
+            Value *ret_i;
+            if (element_bits == 8) {
+                Intrinsic::ID intrin =
+                    start == 0 ? IPICK(is_128B, Intrinsic::hexagon_V6_vpackeb) : IPICK(is_128B, Intrinsic::hexagon_V6_vpackob);
+                ret_i = call_intrin_cast(native_ty, intrin, {ab_i1, ab_i0});
+            } else if (element_bits == 16) {
+                Intrinsic::ID intrin =
+                    start == 0 ? IPICK(is_128B, Intrinsic::hexagon_V6_vpackeh) : IPICK(is_128B, Intrinsic::hexagon_V6_vpackoh);
+                ret_i = call_intrin_cast(native_ty, intrin, {ab_i1, ab_i0});
+            } else if (element_bits%8 == 0) {
+                // Need to use vdealw, followed by lo/hi.
+                // TODO: Is there a better instruction? This generates a
+                // double vector, then only uses half of the result.
+                int element_bytes = element_bits / 8;
+                Value *packed = call_intrin_cast(native2_ty,
+                                                 IPICK(is_128B, Intrinsic::hexagon_V6_vdealvdd),
+                                                 {ab_i1, ab_i0, ConstantInt::get(i32_t, -element_bytes)});
+                Intrinsic::ID intrin =
+                    start == 0 ? IPICK(is_128B, Intrinsic::hexagon_V6_lo) : IPICK(is_128B, Intrinsic::hexagon_V6_hi);
+                ret_i = call_intrin_cast(native_ty, intrin, {packed});
+            } else {
+                return CodeGen_Posix::shuffle_vectors(a, b, indices);
+            }
+            if (i + native_elements > result_elements) {
+                // This is the last vector, and it has a few extra
+                // elements. Slice it down.
+                ret_i = slice_vector(ret_i, 0, i + native_elements - result_elements);
+            }
+            ret.push_back(ret_i);
+        }
+        return concat_vectors(ret);
+    }
+
+    // TODO: There are more HVX permute instructions that could be
+    // implemented here, such as vdelta/vrdelta.
+
+    if (element_bits <= 16) {
+        return vlut(concat_vectors({a, b}), indices);
+    } else {
+        return CodeGen_Posix::shuffle_vectors(a, b, indices);
+    }
+}
+
+Value *CodeGen_Hexagon::vlut(Value *lut, Value *idx, int min_index, int max_index) {
+    bool is_128B = target.has_feature(Halide::Target::HVX_128);
+    llvm::Type *lut_ty = lut->getType();
+    llvm::Type *idx_ty = idx->getType();
+
+    internal_assert(isa<VectorType>(lut_ty));
+    internal_assert(isa<VectorType>(idx_ty));
+    internal_assert(idx_ty->getScalarSizeInBits() == 8);
+    internal_assert(min_index >= 0);
+    internal_assert(max_index <= 255);
+
+    Intrinsic::ID vlut_id = Intrinsic::not_intrinsic;
+    Intrinsic::ID vlut_acc_id = Intrinsic::not_intrinsic;
+    Intrinsic::ID vshuff_id = Intrinsic::not_intrinsic;
+    if (lut_ty->getScalarSizeInBits() == 8) {
+        // We can use vlut32.
+        vlut_id = IPICK(is_128B, Intrinsic::hexagon_V6_vlutvvb);
+        vlut_acc_id = IPICK(is_128B, Intrinsic::hexagon_V6_vlutvvb_oracc);
+        vshuff_id = IPICK(is_128B, Intrinsic::hexagon_V6_vshuffb);
+    } else {
+        // We can use vlut16. If the LUT has greater than 16 bit
+        // elements, we replicate the LUT indices.
+        int replicate = lut_ty->getScalarSizeInBits() / 16;
+        if (replicate > 1) {
+            // TODO: Reinterpret this as a LUT lookup of 16 bit entries.
+            internal_error << "LUT with greater than 16 bit entries not implemented.\n";
+        }
+        vlut_id = IPICK(is_128B, Intrinsic::hexagon_V6_vlutvwh);
+        vlut_acc_id = IPICK(is_128B, Intrinsic::hexagon_V6_vlutvwh_oracc);
+        vshuff_id = IPICK(is_128B, Intrinsic::hexagon_V6_vshuffh);
+    }
+
+    // There are two dimensions in which we need to slice up the
+    // inputs. First, if the index is larger than a native vector, we
+    // need to slice up the operation into native vectors of
+    // indices. Second, the LUT may need to be broken into several
+    // stages, and that may need to be further broken up into vmux
+    // operations.
+
+    // Split up the LUT into native vectors, using the max_index to
+    // indicate how many we need.
+    max_index = std::min(max_index, static_cast<int>(lut_ty->getVectorNumElements()) - 1);
+    int native_idx_elements = native_vector_bits()/8;
+    int native_lut_elements = native_vector_bits()/lut_ty->getScalarSizeInBits();
+
+    // The vlut instructions work on pairs of LUTs interleaved, with
+    // each lut containing lut_slice_elements. We need to interleave
+    // pairs of the native LUTs to make a full set of native LUTs.
+    vector<Value *> lut_slices;
+    for (int i = 0; i <= max_index; i += native_lut_elements) {
+        Value *lut_slice = slice_vector(lut, i, native_lut_elements);
+        lut_slice = call_intrin_cast(lut_slice->getType(), vshuff_id, {lut_slice});
+        lut_slices.push_back(lut_slice);
+    }
+    internal_assert(!lut_slices.empty());
+
+    llvm::Type *native_result_ty =
+        llvm::VectorType::get(lut_ty->getVectorElementType(), native_idx_elements);
+
+    // The result will have the same number of elements as idx.
+    int idx_elements = idx_ty->getVectorNumElements();
+
+    // Each LUT has 1 pair of even/odd mask values for HVX 64, 2 for
+    // HVX 128.  We may not need all of the passes, if the LUT has
+    // fewer than half of the elements in an HVX 128 vector.
+    int lut_passes = is_128B ? 2 : 1;
+
+    vector<Value *> result;
+    for (int i = 0; i < idx_elements; i += native_idx_elements) {
+        Value *idx_i = slice_vector(idx, i, native_idx_elements);
+
+        if (lut_ty->getScalarSizeInBits() == 16) {
+            // vlut16 deinterleaves its output. We can either
+            // interleave the result, or the indices.  It's slightly
+            // cheaper to interleave the indices (they are single
+            // vectors, vs. the result which is a double vector), and
+            // if the indices are constant (which is true for boundary
+            // conditions) this should get lifted out of any loops.
+            idx_i = call_intrin_cast(idx_i->getType(), IPICK(is_128B, Intrinsic::hexagon_V6_vshuffb), {idx_i});
+        }
+
+        Value *result_i = nullptr;
+        for (int j = 0; j < static_cast<int>(lut_slices.size()); j++) {
+            for (int k = 0; k < lut_passes; k++) {
+                int pass_index = lut_passes * j + k;
+                Value *mask[2] = {
+                    ConstantInt::get(i32_t, 2 * pass_index + 0),
+                    ConstantInt::get(i32_t, 2 * pass_index + 1),
+                };
+                if (result_i == nullptr) {
+                    // The first native LUT, use vlut.
+                    result_i = call_intrin_cast(native_result_ty, vlut_id,
+                                                {idx_i, lut_slices[j], mask[0]});
+                    result_i = call_intrin_cast(native_result_ty, vlut_acc_id,
+                                                {result_i, idx_i, lut_slices[j], mask[1]});
+                } else if (max_index >= pass_index * native_lut_elements / lut_passes) {
+                    // Not the first native LUT, accumulate the LUT
+                    // with the previous result.
+                    for (int m = 0; m < 2; m++) {
+                        result_i = call_intrin_cast(native_result_ty, vlut_acc_id,
+                                                    {result_i, idx_i, lut_slices[j], mask[m]});
+                    }
+                }
+            }
+        }
+
+        result.push_back(result_i);
+    }
+
+    return slice_vector(concat_vectors(result), 0, idx_elements);
+}
+
+bool is_power_of_two(int x) { return (x & (x - 1)) == 0; }
+
+// vdelta and vrdelta are instructions that take an input vector and
+// pass it through a network made up of levels. Each element x at each
+// level i can either take the element from the previous level at the
+// same position x, or take the element from the previous level at y,
+// where y is x with the bit at position i flipped. This forms a
+// butterfly network. vdelta and vrdelta have the same structure,
+// except the ordering of the levels is flipped.
+
+// Find a descriptor of the path between x1 and x2. To find the path
+// between element x1 and element x2, the algorithm is the same for
+// both vdelta and vrdelta. To get from x1 to x2, we need to take the
+// switch path at level i if bit i of x1 and x2 are not the same. The
+// path is an integer where the bit at position i indicates the switch
+// that jumps by i elements should be on.
+int generate_delta_path(int x1, int x2) {
+    int result = 0;
+    for (int delta = 1; x1 != x2; delta *= 2) {
+        if ((x1 & delta) != (x2 & delta)) {
+            result |= delta;
+        }
+        x1 &= ~delta;
+        x2 &= ~delta;
+    }
+    return result;
+}
+
+// Generate the switch descriptors for a vdelta or vrdelta
+// instruction. To do this, we need to generate the switch descriptors
+// of each output to input path, and then make sure that none of the
+// switches need conflicting settings.
+bool generate_vdelta(const std::vector<int> &indices, bool reverse, std::vector<int> &switches) {
+    int width = (int)indices.size();
+    internal_assert(is_power_of_two(width));
+    switches.resize(width);
+
+    // For each switch bit, we have a bit indicating whether we
+    // already care about the switch position.
+    std::vector<int> switches_used(switches.size());
+    std::fill(switches.begin(), switches.end(), 0);
+    std::fill(switches_used.begin(), switches_used.end(), 0);
+
+    for (int out = 0; out < width; out++) {
+        int in = indices[out];
+        if (in == -1) {
+            // We don't care what the output is at this index.
+            continue;
+        }
+        int path = generate_delta_path(out, in);
+        int x = out;
+        // Follow the path backwards, setting the switches we need as
+        // we go. This is the only place where vdelta and vrdelta
+        // differ. For vdelta, we start with the small jumps, vrdelta
+        // starts with the large jumps.
+        int start = reverse ? (1 << 30) : 1;
+        for (int delta = start; path != 0; delta = reverse ? delta / 2 : delta * 2) {
+            int switch_state = path & delta;
+            if ((switches_used[x] & delta) != 0) {
+                // This switch is already set...
+                if ((switches[x] & delta) != switch_state) {
+                    // ... and it is set to the wrong thing. We can't represent this shuffle.
+                    return false;
+                }
+            } else {
+                // This switch is not already set, set it to the value we want, and mark it used.
+                switches_used[x] |= delta;
+                switches[x] |= switch_state;
+            }
+            // Update our position in the network.
+            if (switch_state) {
+                x ^= delta;
+            }
+            path &= ~delta;
+        }
+    }
+    return true;
+}
+
+Value *CodeGen_Hexagon::vdelta(Value *lut, const vector<int> &indices) {
+    bool is_128B = target.has_feature(Halide::Target::HVX_128);
+    llvm::Type *lut_ty = lut->getType();
+    int lut_elements = lut_ty->getVectorNumElements();
+    llvm::Type *element_ty = lut_ty->getVectorElementType();
+    int element_bits = element_ty->getScalarSizeInBits();
+    int native_elements = native_vector_bits()/element_ty->getScalarSizeInBits();
+    int result_elements = indices.size();
+
+    // If the input is not a vector of 8 bit elements, replicate the
+    // indices and cast the LUT.
+    if (element_bits != 8) {
+        int replicate = element_bits / 8;
+        assert(replicate != 0);
+        llvm::Type *new_lut_ty = llvm::VectorType::get(i8_t, lut_elements * replicate);
+        Value *i8_lut = builder->CreateBitCast(lut, new_lut_ty);
+        vector<int> i8_indices(indices.size() * replicate);
+        for (size_t i = 0; i < indices.size(); i++) {
+            for (int j = 0; j < replicate; j++) {
+                i8_indices[i * replicate + j] = indices[i] * replicate + j;
+            }
+        }
+        Value *result = vdelta(i8_lut, i8_indices);
+        result = builder->CreateBitCast(result, lut_ty);
+        return result;
+    }
+
+    // We can only use vdelta to produce a single native vector at a
+    // time. Break the input into native vector length shuffles.
+    if (result_elements != native_elements) {
+        vector<llvm::Value *> ret;
+        for (int i = 0; i < result_elements; i += native_elements) {
+            vector<int> indices_i(native_elements);
+            for (int j = 0; j < native_elements; j++) {
+                if (i + j < result_elements) {
+                    indices_i[j] = indices[i + j];
+                } else {
+                    indices_i[j] = -1;
+                }
+            }
+            Value *ret_i = vdelta(lut, indices_i);
+            if (result_elements - i < native_elements) {
+                // This was a fractional vector at the end, slice the part we want.
+                ret_i = slice_vector(ret_i, 0, result_elements - i);
+            }
+            ret.push_back(ret_i);
+        }
+        return concat_vectors(ret);
+    }
+
+    assert(result_elements == native_elements);
+
+    // We can only use vdelta to shuffle a single native vector of
+    // input. If we have more than one, we need to break it into
+    // multiple vdelta operations, and combine them with vmux.
+    if (lut_elements != native_elements) {
+        Value *ret = nullptr;
+        for (int i = 0; i < lut_elements; i += native_elements) {
+            Value *lut_i = slice_vector(lut, i, native_elements);
+            vector<int> indices_i(native_elements);
+            vector<Constant *> mask(native_elements);
+            bool all_used = true;
+            bool none_used = true;
+            for (int j = 0; j < native_elements; j++) {
+                int idx = indices[j] - i;
+                if (0 <= idx && idx < native_elements) {
+                    indices_i[j] = idx;
+                    mask[j] = ConstantInt::get(i8_t, 255);
+                    none_used = false;
+                } else {
+                    indices_i[j] = -1;
+                    mask[j] = ConstantInt::get(i8_t, 0);
+                    all_used = false;
+                }
+            }
+            Value *ret_i = vdelta(lut_i, indices_i);
+            if (all_used || ret == nullptr) {
+                // If the mask is all ones, or this is the first result, we don't need to preserve past results.
+                ret = ret_i;
+            } else if (!none_used) {
+                // Create a condition value for which elements of the range are valid for this index.
+                // We can't make a constant vector of <1024 x i1>, it crashes the Hexagon LLVM backend before LLVM version 6.0.
+                Value *minus_one = codegen(make_const(UInt(8, mask.size()), 255));
+                Value *hack_mask = call_intrin(lut_i->getType(), "halide.hexagon.eq.vb.vb", {ConstantVector::get(mask), minus_one});
+
+                ret = call_intrin(lut_i->getType(),
+                                  "halide.hexagon.mux.vb.vb",
+                                  {hack_mask, ret_i, ret});
+            }
+        }
+        return ret;
+    }
+
+    // We now have a single native vector to native vector shuffle. Try
+    // Generating a vdelta or vrdelta.
+    for (bool reverse : {false, true}) {
+        std::vector<int> switches;
+        if (generate_vdelta(indices, reverse, switches)) {
+            vector<Constant *> control_elements(switches.size());
+            for (int i = 0; i < (int)switches.size(); i++) {
+                control_elements[i] = ConstantInt::get(i8_t, switches[i]);
+            }
+            Value *control = ConstantVector::get(control_elements);
+            Intrinsic::ID vdelta_id = IPICK(is_128B, reverse ? Intrinsic::hexagon_V6_vrdelta : Intrinsic::hexagon_V6_vdelta);
+            return call_intrin_cast(lut_ty, vdelta_id, {lut, control});
+        }
+    }
+
+    // TODO: If the above fails, we might be able to use a vdelta and
+    // vrdelta instruction together to implement the shuffle.
+    internal_error << "Unsupported vdelta operation.\n";
+
+    // TODO: If the vdelta results are sparsely used, it might be
+    // better to use vlut.
+    return vlut(lut, indices);
+}
+
+Value *CodeGen_Hexagon::vlut(Value *lut, const vector<int> &indices) {
+    // TODO: We can take advantage of the fact that we know the
+    // indices at compile time to implement a few
+    // optimizations. First, we can avoid running the vlut
+    // instructions for ranges of the LUT for which we know we don't
+    // have any indices. This wil happen often for strided
+    // ramps. Second, we can do the shuffling of the indices necessary
+    // at compile time.
+    vector<Constant *>llvm_indices;
+    llvm_indices.reserve(indices.size());
+    int min_index = lut->getType()->getVectorNumElements();
+    int max_index = 0;
+    for (int i : indices) {
+        if (i != -1) {
+            min_index = std::min(min_index, i);
+            max_index = std::max(max_index, i);
+        }
+        llvm_indices.push_back(ConstantInt::get(i8_t, i));
+    }
+
+    if (max_index <= 255) {
+        // If we can do this with one vlut, do it now.
+        return vlut(lut, ConstantVector::get(llvm_indices), min_index, max_index);
+    }
+
+    llvm::Type *i8x_t = VectorType::get(i8_t, indices.size());
+    llvm::Type *i16x_t = VectorType::get(i16_t, indices.size());
+
+    // We use i16 indices because we can't support LUTs with more than
+    // 32k elements anyways without massive stack spilling (the LUT
+    // must fit in registers), and it costs some runtime performance
+    // due to the conversion to 8 bit. This is also crazy and should
+    // never happen.
+    internal_assert(max_index < std::numeric_limits<int16_t>::max())
+        << "vlut of more than 32k elements not supported \n";
+
+    // We need to break the index up into ranges of up to 256, and mux
+    // the ranges together after using vlut on each range. This vector
+    // contains the result of each range, and a condition vector
+    // indicating whether the result should be used.
+    vector<std::pair<Value *, Value *>> ranges;
+    for (int min_index_i = 0; min_index_i < max_index; min_index_i += 256) {
+        // Make a vector of the indices shifted such that the min of
+        // this range is at 0.
+        vector<Constant *> llvm_indices;
+        llvm_indices.reserve(indices.size());
+        for (int i : indices) {
+            llvm_indices.push_back(ConstantInt::get(i16_t, i - min_index_i));
+        }
+        Value *llvm_index = ConstantVector::get(llvm_indices);
+
+        // Create a condition value for which elements of the range are valid for this index.
+        // We can't make a constant vector of <1024 x i1>, it crashes the Hexagon LLVM backend.
+        Value *minus_one = codegen(make_const(UInt(16, indices.size()), -1));
+        Value *use_index = call_intrin(i16x_t, "halide.hexagon.gt.vh.vh", {llvm_index, minus_one});
+
+        // After we've eliminated the invalid elements, we can
+        // truncate to 8 bits, as vlut requires.
+        llvm_index = call_intrin(i8x_t, "halide.hexagon.pack.vh", {llvm_index});
+        use_index = call_intrin(i8x_t, "halide.hexagon.pack.vh", {use_index});
+
+        int range_extent_i = std::min(max_index - min_index_i, 255);
+        Value *range_i = vlut(slice_vector(lut, min_index_i, range_extent_i), llvm_index, 0, range_extent_i);
+
+        ranges.push_back({ range_i, use_index });
+    }
+
+    // TODO: This could be reduced hierarchically instead of in
+    // order. However, this requires the condition for the mux to be
+    // quite tricky.
+    Value *result = ranges[0].first;
+    llvm::Type *element_ty = result->getType()->getVectorElementType();
+    string mux = "halide.hexagon.mux";
+    switch (element_ty->getScalarSizeInBits()) {
+    case 8: mux += ".vb.vb"; break;
+    case 16: mux += ".vh.vh"; break;
+    case 32: mux += ".vw.vw"; break;
+    default: internal_error << "Cannot constant select vector of " << element_ty->getScalarSizeInBits() << "\n";
+    }
+    for (size_t i = 1; i < ranges.size(); i++) {
+        result = call_intrin(result->getType(), mux, {ranges[i].second, ranges[i].first, result});
+    }
+    return result;
+}
+
+namespace {
+
+string type_suffix(Type type, bool signed_variants = true) {
+    string prefix = type.is_vector() ? ".v" : ".";
+    if (type.is_int() || !signed_variants) {
+        switch (type.bits()) {
+        case 8: return prefix + "b";
+        case 16: return prefix + "h";
+        case 32: return prefix + "w";
+        }
+    } else if (type.is_uint()) {
+        switch (type.bits()) {
+        case 8: return prefix + "ub";
+        case 16: return prefix + "uh";
+        case 32: return prefix + "uw";
+        }
+    }
+    internal_error << "Unsupported HVX type: " << type << "\n";
+    return "";
+}
+
+string type_suffix(Expr a, bool signed_variants = true) {
+    return type_suffix(a.type(), signed_variants);
+}
+
+string type_suffix(Expr a, Expr b, bool signed_variants = true) {
+    return type_suffix(a, signed_variants) + type_suffix(b, signed_variants);
+}
+
+string type_suffix(const vector<Expr> &ops, bool signed_variants = true) {
+    if (ops.empty()) return "";
+    string suffix = type_suffix(ops.front(), signed_variants);
+    for (size_t i = 1; i < ops.size(); i++) {
+        suffix = suffix + type_suffix(ops[i], signed_variants);
+    }
+    return suffix;
+}
+
+}  // namespace
+
+Value *CodeGen_Hexagon::call_intrin(Type result_type, const string &name,
+                                    vector<Expr> args, bool maybe) {
+    llvm::Function *fn = module->getFunction(name);
+    if (maybe && !fn) return nullptr;
+    internal_assert(fn) << "Function '" << name << "' not found\n";
+    if (fn->getReturnType()->getVectorNumElements()*2 <= static_cast<unsigned>(result_type.lanes())) {
+        // We have fewer than half as many lanes in our intrinsic as
+        // we have in the call. Check to see if a double vector
+        // version of this intrinsic exists.
+        llvm::Function *fn2 = module->getFunction(name + ".dv");
+        if (fn2) {
+            fn = fn2;
+        }
+    }
+    return call_intrin(result_type,
+                       fn->getReturnType()->getVectorNumElements(),
+                       fn->getName(),
+                       args);
+}
+
+Value *CodeGen_Hexagon::call_intrin(llvm::Type *result_type, const string &name,
+                                    vector<Value *> args, bool maybe) {
+    llvm::Function *fn = module->getFunction(name);
+    if (maybe && !fn) return nullptr;
+    internal_assert(fn) << "Function '" << name << "' not found\n";
+    if (fn->getReturnType()->getVectorNumElements()*2 <= result_type->getVectorNumElements()) {
+        // We have fewer than half as many lanes in our intrinsic as
+        // we have in the call. Check to see if a double vector
+        // version of this intrinsic exists.
+        llvm::Function *fn2 = module->getFunction(name + ".dv");
+        if (fn2) {
+            fn = fn2;
+        }
+    }
+    return call_intrin(result_type,
+                       fn->getReturnType()->getVectorNumElements(),
+                       fn->getName(),
+                       args);
+}
+
+string CodeGen_Hexagon::mcpu() const {
+    if (target.has_feature(Halide::Target::HVX_v66)) {
+        return "hexagonv66";
+    } else if (target.has_feature(Halide::Target::HVX_v65)) {
+        return "hexagonv65";
+    } else if (target.has_feature(Halide::Target::HVX_v62)) {
+        return "hexagonv62";
+    } else {
+        return "hexagonv60";
+    }
+}
+
+string CodeGen_Hexagon::mattrs() const {
+    std::stringstream attrs;
+    if (target.has_feature(Halide::Target::HVX_128)) {
+#if LLVM_VERSION < 60
+        attrs << "+hvx-double";
+#else
+        attrs << "+hvx-length128b";
+#endif
+    } else {
+#if LLVM_VERSION < 60
+        attrs << "+hvx";
+#else
+        attrs << "+hvx-length64b";
+#endif
+    }
+#if LLVM_VERSION >= 50
+    attrs << ",+long-calls";
+#else
+    user_error << "LLVM version 5.0 or greater is required for the Hexagon backend";
+#endif
+    return attrs.str();
+}
+
+bool CodeGen_Hexagon::use_soft_float_abi() const {
+    return false;
+}
+
+int CodeGen_Hexagon::native_vector_bits() const {
+    if (target.has_feature(Halide::Target::HVX_128)) {
+        return 128*8;
+    } else {
+        return 64*8;
+    }
+}
+
+void CodeGen_Hexagon::visit(const Add *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(op->type,
+                            "halide.hexagon.add" + type_suffix(op->a, op->b, false),
+                            {op->a, op->b});
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const Sub *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(op->type,
+                            "halide.hexagon.sub" + type_suffix(op->a, op->b, false),
+                            {op->a, op->b});
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+namespace {
+
+Expr maybe_scalar(Expr x) {
+    const Broadcast *xb = x.as<Broadcast>();
+    if (xb) {
+        return xb->value;
+    } else {
+        return x;
+    }
+}
+
+}  // namespace
+
+void CodeGen_Hexagon::visit(const Mul *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(op->type,
+                            "halide.hexagon.mul" + type_suffix(op->a, op->b),
+                            {op->a, op->b},
+                            true /*maybe*/);
+        if (value) return;
+
+        // Hexagon has mostly widening multiplies. Try to find a
+        // widening multiply we can use.
+        // TODO: It would probably be better to just define a bunch of
+        // mul.*.* functions in the runtime HVX modules so the above
+        // implementation can be used unconditionally.
+        value = call_intrin(op->type,
+                            "halide.hexagon.mpy" + type_suffix(op->a, op->b),
+                            {op->a, op->b},
+                            true /*maybe*/);
+        if (value) {
+            // We found a widening op, we need to narrow back
+            // down. The widening multiply deinterleaved the result,
+            // but the trunc operation reinterleaves.
+            Type wide = op->type.with_bits(op->type.bits()*2);
+            value = call_intrin(llvm_type_of(op->type),
+                                "halide.hexagon.trunc" + type_suffix(wide, false),
+                                {value});
+            return;
+        }
+
+        internal_error << "Unhandled HVX multiply "
+                       << op->a.type() << "*" << op->b.type() << "\n"
+                       << Expr(op) << "\n";
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+Expr CodeGen_Hexagon::mulhi_shr(Expr a, Expr b, int shr) {
+    Type ty = a.type();
+    if (ty.is_vector() && (ty.bits() == 8 || ty.bits() == 16)) {
+        Type wide_ty = ty.with_bits(ty.bits() * 2);
+
+        // Generate a widening multiply.
+        Expr p_wide = Call::make(wide_ty, "halide.hexagon.mpy" + type_suffix(a, b),
+                                 {a, b}, Call::PureExtern);
+
+        // Keep the high half (truncate the low half). This also
+        // re-interleaves after mpy deinterleaved.
+        Expr p = Call::make(ty, "halide.hexagon.trunclo" + type_suffix(p_wide, false),
+                            {p_wide}, Call::PureExtern);
+
+        // Apply the remaining shift.
+        if (shr != 0) {
+            p = p >> shr;
+        }
+
+        return p;
+    } else {
+        return CodeGen_Posix::mulhi_shr(a, b, shr);
+    }
+}
+
+Expr CodeGen_Hexagon::sorted_avg(Expr a, Expr b) {
+    Type ty = a.type();
+    if (ty.is_vector() && ((ty.is_uint() && (ty.bits() == 8 || ty.bits() == 16)) ||
+                           (ty.is_int() && (ty.bits() == 16 || ty.bits() == 32)))) {
+        return Call::make(ty, "halide.hexagon.avg" + type_suffix(a, b),
+                          {a, b}, Call::PureExtern);
+    } else {
+        return CodeGen_Posix::sorted_avg(a, b);
+    }
+}
+
+void CodeGen_Hexagon::visit(const Div *op) {
+    CodeGen_Posix::visit(op);
+}
+
+void CodeGen_Hexagon::visit(const Cast *op) {
+    // TODO: Do we need to handle same-sized vector casts before LLVM sees them?
+    CodeGen_Posix::visit(op);
+}
+
+void CodeGen_Hexagon::visit(const Call *op) {
+    internal_assert(op->is_extern() || op->is_intrinsic())
+        << "Can only codegen extern calls and intrinsics\n";
+
+    // Map Halide functions to Hexagon intrinsics, plus a boolean
+    // indicating if the intrinsic has signed variants or not.
+    static std::map<string, std::pair<string, bool>> functions = {
+        { Call::abs, { "halide.hexagon.abs", true } },
+        { Call::absd, { "halide.hexagon.absd", true } },
+        { Call::bitwise_and, { "halide.hexagon.and", false } },
+        { Call::bitwise_or, { "halide.hexagon.or", false } },
+        { Call::bitwise_xor, { "halide.hexagon.xor", false } },
+        { Call::bitwise_not, { "halide.hexagon.not", false } },
+        { Call::count_leading_zeros, { "halide.hexagon.clz", false } },
+        { Call::popcount, { "halide.hexagon.popcount", false } },
+    };
+
+    if (is_native_interleave(op) || is_native_deinterleave(op)) {
+        user_assert(op->type.lanes() % (native_vector_bits() * 2 / op->type.bits()) == 0)
+            << "Interleave or deinterleave will result in miscompilation, "
+            << "see https://github.com/halide/Halide/issues/1582\n" << Expr(op) << "\n";
+    }
+
+    if (starts_with(op->name, "halide.hexagon.")) {
+        // Handle all of the intrinsics we generated in
+        // hexagon_optimize.  I'm not sure why this is different than
+        // letting it fall through to CodeGen_LLVM.
+        value = call_intrin(op->type, op->name, op->args);
+        return;
+    }
+
+    if (op->type.is_vector()) {
+        auto i = functions.find(op->name);
+        if (i != functions.end()) {
+            string intrin =
+                i->second.first + type_suffix(op->args, i->second.second);
+            value = call_intrin(op->type, intrin, op->args, true /*maybe*/);
+            if (value) return;
+        } else if (op->is_intrinsic(Call::shift_left) ||
+                   op->is_intrinsic(Call::shift_right)) {
+
+            internal_assert(op->args.size() == 2);
+            string instr = op->is_intrinsic(Call::shift_left) ? "halide.hexagon.shl" : "halide.hexagon.shr";
+            Expr b = maybe_scalar(op->args[1]);
+            value = call_intrin(op->type,
+                                instr + type_suffix(op->args[0], b),
+                                {op->args[0], b});
+            return;
+        } else if (op->is_intrinsic("dynamic_shuffle")) {
+            internal_assert(op->args.size() == 4);
+            const int64_t *min_index = as_const_int(op->args[2]);
+            const int64_t *max_index = as_const_int(op->args[3]);
+            internal_assert(min_index && max_index);
+            Value *lut = codegen(op->args[0]);
+            Value *idx = codegen(op->args[1]);
+            value = vlut(lut, idx, *min_index, *max_index);
+            return;
+        } else if (op->is_intrinsic(Call::select_mask)) {
+            internal_assert(op->args.size() == 3);
+            // eliminate_bool_vectors has replaced all boolean vectors
+            // with integer vectors of the appropriate size, so we
+            // just need to convert the select_mask intrinsic to a
+            // hexagon mux intrinsic.
+            value = call_intrin(op->type,
+                                "halide.hexagon.mux" +
+                                type_suffix(op->args[1], op->args[2], false),
+                                op->args);
+            return;
+        } else if (op->is_intrinsic(Call::cast_mask)) {
+            internal_error << "cast_mask should already have been handled in HexagonOptimize\n";
+        }
+    }
+
+    if (op->is_intrinsic(Call::bool_to_mask)) {
+        internal_assert(op->args.size() == 1);
+        if (op->args[0].type().is_vector()) {
+            // The argument is already a mask of the right width.
+            op->args[0].accept(this);
+        } else {
+            // The argument is a scalar bool. Converting it to
+            // all-ones or all-zeros is sufficient for HVX masks
+            // (mux just looks at the LSB of each byte).
+            Expr equiv = -Cast::make(op->type, op->args[0]);
+            equiv.accept(this);
+        }
+        return;
+    } else if (op->is_intrinsic(Call::extract_mask_element)) {
+        internal_assert(op->args.size() == 2);
+        const int64_t *index = as_const_int(op->args[1]);
+        internal_assert(index);
+        value = codegen(Cast::make(Bool(), Shuffle::make_extract_element(op->args[0], *index)));
+        return;
+    }
+
+    if (op->is_intrinsic(Call::prefetch)) {
+        internal_assert((op->args.size() == 4) || (op->args.size() == 6))
+            << "Hexagon only supports 1D or 2D prefetch\n";
+
+        vector<llvm::Value *> args;
+        args.push_back(codegen_buffer_pointer(codegen(op->args[0]), op->type, op->args[1]));
+
+        Expr extent_0_bytes = op->args[2] * op->args[3] * op->type.bytes();
+        args.push_back(codegen(extent_0_bytes));
+
+        llvm::Function *prefetch_fn = nullptr;
+        if (op->args.size() == 4) { // 1D prefetch: {base, offset, extent0, stride0}
+            prefetch_fn = module->getFunction("_halide_prefetch");
+        } else { // 2D prefetch: {base, offset, extent0, stride0, extent1, stride1}
+            prefetch_fn = module->getFunction("_halide_prefetch_2d");
+            args.push_back(codegen(op->args[4]));
+            Expr stride_1_bytes = op->args[5] * op->type.bytes();
+            args.push_back(codegen(stride_1_bytes));
+        }
+        internal_assert(prefetch_fn);
+
+        // The first argument is a pointer, which has type i8*. We
+        // need to cast the argument, which might be a pointer to a
+        // different type.
+        llvm::Type *ptr_type = prefetch_fn->getFunctionType()->params()[0];
+        args[0] = builder->CreateBitCast(args[0], ptr_type);
+
+        value = builder->CreateCall(prefetch_fn, args);
+        return;
+    }
+
+    CodeGen_Posix::visit(op);
+}
+
+void CodeGen_Hexagon::visit(const Broadcast *op) {
+    if (op->lanes * op->type.bits() <= 32) {
+        // If the result is not more than 32 bits, just use scalar code.
+        CodeGen_Posix::visit(op);
+    } else {
+        // TODO: Use vd0?
+        string v62orLater_suffix = "";
+        if (target.features_any_of({Target::HVX_v62, Target::HVX_v65, Target::HVX_v66}) &&
+            (op->value.type().bits() == 8 || op->value.type().bits() == 16))
+            v62orLater_suffix = "_v62";
+
+        value = call_intrin(op->type,
+                            "halide.hexagon.splat" + v62orLater_suffix + type_suffix(op->value, false),
+                            {op->value});
+    }
+}
+
+void CodeGen_Hexagon::visit(const Max *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(op->type,
+                            "halide.hexagon.max" + type_suffix(op->a, op->b),
+                            {op->a, op->b},
+                            true /*maybe*/);
+        if (!value) {
+            Expr equiv =
+                Call::make(op->type, Call::select_mask, {op->a > op->b, op->a, op->b}, Call::PureIntrinsic);
+            equiv = common_subexpression_elimination(equiv);
+            value = codegen(equiv);
+        }
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const Min *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(op->type,
+                            "halide.hexagon.min" + type_suffix(op->a, op->b),
+                            {op->a, op->b},
+                            true /*maybe*/);
+        if (!value) {
+            Expr equiv =
+                Call::make(op->type, Call::select_mask, {op->a > op->b, op->b, op->a}, Call::PureIntrinsic);
+            equiv = common_subexpression_elimination(equiv);
+            value = codegen(equiv);
+        }
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const Select *op) {
+    internal_assert(op->condition.type().is_scalar()) << Expr(op) << "\n";
+
+    if (op->type.is_vector()) {
+        // Implement scalar conditions on vector values with if-then-else.
+        value = codegen(Call::make(op->type, Call::if_then_else,
+                                   {op->condition, op->true_value, op->false_value},
+                                   Call::Intrinsic));
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const GT *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(eliminated_bool_type(op->type, op->a.type()),
+                            "halide.hexagon.gt" + type_suffix(op->a, op->b),
+                            {op->a, op->b});
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const EQ *op) {
+    if (op->type.is_vector()) {
+        value = call_intrin(eliminated_bool_type(op->type, op->a.type()),
+                            "halide.hexagon.eq" + type_suffix(op->a, op->b, false),
+                            {op->a, op->b});
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const GE *op) {
+    if (op->type.is_vector()) {
+        Expr ge = Not::make(GT::make(op->b, op->a));
+        ge = eliminate_bool_vectors(ge);
+        ge.accept(this);
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const LE *op) {
+    if (op->type.is_vector()) {
+        Expr le = Not::make(GT::make(op->a, op->b));
+        le = eliminate_bool_vectors(le);
+        le.accept(this);
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const LT *op) {
+    if (op->type.is_vector()) {
+        Expr lt = GT::make(op->b, op->a);
+        lt.accept(this);
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const NE *op) {
+    if (op->type.is_vector()) {
+        Expr eq = Not::make(EQ::make(op->a, op->b));
+        eq = eliminate_bool_vectors(eq);
+        eq.accept(this);
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+Value *CodeGen_Hexagon::codegen_allocation_size(const std::string &name, Type type, const std::vector<Expr> &extents) {
+    // Compute size from list of extents checking for overflow.
+
+    Expr overflow = make_zero(UInt(64));
+    Expr total_size = make_const(UInt(64), type.lanes() * type.bytes());
+
+    // We'll multiply all the extents into the 64-bit value
+    // total_size. We'll also track (total_size >> 32) as a 64-bit
+    // value to check for overflow as we go. The loop invariant will
+    // be that either the overflow Expr is non-zero, or total_size_hi
+    // only occupies the bottom 32-bits. Overflow could be more simply
+    // checked for using division, but that's slower at runtime. This
+    // method generates much better assembly.
+    Expr total_size_hi = make_zero(UInt(64));
+
+    Expr low_mask = make_const(UInt(64), (uint64_t)(0xffffffff));
+    for (size_t i = 0; i < extents.size(); i++) {
+        Expr next_extent = cast(UInt(32), extents[i]);
+
+        // Update total_size >> 32. This math can't overflow due to
+        // the loop invariant:
+        total_size_hi *= next_extent;
+        // Deal with carry from the low bits. Still can't overflow.
+        total_size_hi += ((total_size & low_mask) * next_extent) >> 32;
+
+        // Update total_size. This may overflow.
+        total_size *= next_extent;
+
+        // We can check for overflow by asserting that total_size_hi
+        // is still a 32-bit number.
+        overflow = overflow | (total_size_hi >> 32);
+    }
+
+    Expr max_size = make_const(UInt(64), target.maximum_buffer_size());
+    Expr size_check = (overflow == 0) && (total_size <= max_size);
+
+    // For constant-sized allocations this check should simplify away.
+    size_check = common_subexpression_elimination(simplify(size_check));
+    if (!is_one(size_check)) {
+        create_assertion(codegen(size_check),
+                         Call::make(Int(32), "halide_error_buffer_allocation_too_large",
+                                    {name, total_size, max_size}, Call::Extern));
+    }
+
+    total_size = simplify(total_size);
+    return codegen(total_size);
+}
+
+void CodeGen_Hexagon::visit(const Allocate *alloc) {
+
+    if (sym_exists(alloc->name)) {
+        user_error << "Can't have two different buffers with the same name: "
+                   << alloc->name << "\n";
+    }
+
+    if (alloc->memory_type == MemoryType::LockedCache) {
+        // We are not allowing Customized memory allocation for Locked Cache 
+        user_assert(!alloc->new_expr.defined()) << "Custom Expression not allowed for Memory Type Locked Cache\n";
+
+        Value *llvm_size = nullptr;
+        int32_t constant_bytes = Allocate::constant_allocation_size(alloc->extents, alloc->name);
+        if (constant_bytes > 0) {
+            constant_bytes *= alloc->type.bytes();
+            llvm_size = codegen(Expr(constant_bytes));
+        } else {
+            llvm_size = codegen_allocation_size(alloc->name, alloc->type, alloc->extents);
+        }
+ 
+        // Only allocate memory if the condition is true, otherwise 0.
+        Value *llvm_condition = codegen(alloc->condition);
+        if (llvm_size != nullptr) {
+            llvm_size = builder->CreateSelect(llvm_condition,
+                                          llvm_size,
+                                          ConstantInt::get(llvm_size->getType(), 0));
+        }
+
+        Allocation allocation;
+        allocation.constant_bytes = constant_bytes;
+        allocation.stack_bytes = 0;
+        allocation.type = alloc->type;
+        allocation.ptr = nullptr;
+        allocation.destructor = nullptr;
+        allocation.destructor_function = nullptr;
+        allocation.name = alloc->name;
+
+        // Call Halide_Locked_Cache_Alloc
+        llvm::Function *alloc_fn = module->getFunction("halide_locked_cache_malloc");
+        internal_assert(alloc_fn) << "Could not find halide_locked_cache_malloc in module\n";
+
+        llvm::Function::arg_iterator arg_iter = alloc_fn->arg_begin();
+        ++arg_iter;  // skip the user context *
+        llvm_size = builder->CreateIntCast(llvm_size, arg_iter->getType(), false);
+
+        debug(4) << "Creating call to halide_locked_cache_malloc for allocation " << alloc->name
+                 << " of size " << alloc->type.bytes();
+        for (Expr e : alloc->extents) {
+            debug(4) << " x " << e;
+        }
+        debug(4) << "\n";
+        Value *args[2] = { get_user_context(), llvm_size };
+
+        Value *call = builder->CreateCall(alloc_fn, args);
+
+        // Fix the type to avoid pointless bitcasts later
+        call = builder->CreatePointerCast(call, llvm_type_of(alloc->type)->getPointerTo());
+        allocation.ptr = call;
+
+        // Assert that the allocation worked.
+        Value *check = builder->CreateIsNotNull(allocation.ptr);
+        if (llvm_size) {
+            Value *zero_size = builder->CreateIsNull(llvm_size);
+            check = builder->CreateOr(check, zero_size);
+        }
+        create_assertion(check, Call::make(Int(32), "halide_error_out_of_memory",
+                                           std::vector<Expr>(), Call::Extern));
+
+        std::string free_function_string;
+        // Register a destructor for this allocation.
+        if (alloc->free_function.empty()) {
+            free_function_string = "halide_locked_cache_free";
+        }
+        llvm::Function *free_fn = module->getFunction(free_function_string);
+        internal_assert(free_fn) << "Could not find " << alloc->free_function << " in module.\n";
+        allocation.destructor = register_destructor(free_fn, allocation.ptr, OnError);
+        allocation.destructor_function = free_fn;
+
+        // Push the allocation base pointer onto the symbol table
+        debug(3) << "Pushing allocation called " << alloc->name << " onto the symbol table\n";
+        allocations.push(alloc->name, allocation);
+
+        sym_push(alloc->name, allocation.ptr);
+
+        codegen(alloc->body);
+
+        // If there was no early free, free it now.
+        if (allocations.contains(alloc->name)) {
+            Allocation alloc_obj = allocations.get(alloc->name);
+            internal_assert(alloc_obj.destructor);
+            trigger_destructor(alloc_obj.destructor_function, alloc_obj.destructor);
+
+            allocations.pop(alloc->name);
+            sym_pop(alloc->name);
+        }
+    } else {
+        // For all other memory types
+        CodeGen_Posix::visit(alloc);
+    }
+}
+
+void CodeGen_Hexagon::visit(const Free *stmt) {
+    Allocation alloc = allocations.get(stmt->name);
+
+    internal_assert(alloc.destructor);
+    trigger_destructor(alloc.destructor_function, alloc.destructor);
+
+    allocations.pop(stmt->name);
+    sym_pop(stmt->name);
+}
+
+}  // namespace Internal
+}  // namespace Halide
