@@ -5,6 +5,7 @@
 #include "printer.h"
 
 #include "mini_cl.h"
+#include "cl_functions.h"
 
 #define INLINE inline __attribute__((always_inline))
 
@@ -180,12 +181,16 @@ class ClContext {
 public:
     cl_context context;
     cl_command_queue cmd_queue;
+    cl_device_id device;
+    bool is_qcom_device;
     cl_int error;
 
     // Constructor sets 'error' if any occurs.
     INLINE ClContext(void *user_context) : user_context(user_context),
                                     context(NULL),
                                     cmd_queue(NULL),
+                                    device(NULL),
+                                    is_qcom_device(false),      
                                     error(CL_SUCCESS) {
         if (clCreateContext == NULL) {
             load_libopencl(user_context);
@@ -196,6 +201,21 @@ public:
 #endif
 
         error = halide_acquire_cl_context(user_context, &context, &cmd_queue);
+        error = clGetContextInfo(context, CL_CONTEXT_DEVICES, sizeof(device), &device, NULL);
+        if (error != CL_SUCCESS) {
+            debug(user_context) << "CL: clGetContextInfo(CL_CONTEXT_DEVICES) failed: "
+                                << get_opencl_error_name(error);
+        }
+        char device_vendor[256] = "";
+        error = clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(device_vendor), device_vendor, NULL);
+        if (error != CL_SUCCESS) {
+            debug(user_context) << "CL: clGetDeviceInfo(CL_DEVICE_VENDOR) failed: "
+                                << get_opencl_error_name(error);
+        }
+        if (strstr(device_vendor,"QUALCOMM")) {
+            is_qcom_device = true;
+            debug(user_context) << "CL: clGetDeviceInfo(CL_DEVICE_VENDOR) found QUALCOMM device";
+        }
         halide_assert(user_context, context != NULL && cmd_queue != NULL);
     }
 
@@ -747,8 +767,50 @@ WEAK int halide_opencl_device_malloc(void *user_context, halide_buffer_t* buf) {
 
     cl_int err;
     debug(user_context) << "    clCreateBuffer -> " << (int)size << " ";
-    cl_mem dev_ptr = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, size, NULL, &err);
-    if (err != CL_SUCCESS || dev_ptr == 0) {
+    // TODO: add check padding. On A540 padding is 0, on A630 it is 64: ION allocation needs to be aware of this info
+    //clGetDeviceInfo(device, CL_DEVICE_EXT_MEM_PADDING_IN_BYTES_QCOM, sizeof(ext_mem_padding_in_bytes), &ext_mem_padding_in_bytes, NULL);
+
+    void *host_ptr = NULL;
+    cl_mem_flags fl = CL_MEM_READ_WRITE;
+    if (buf->read_only) {
+        fl = CL_MEM_READ_ONLY; // TODO: add WRITE_ONLY support
+        debug(user_context) << "    clCreateBuffer setting CL_MEM_READ_ONLY flag\n";
+    }
+    cl_mem_ion_host_ptr ionmem = {{0,0},0,0};
+    if (buf->use_host_ptr_extension && ctx.is_qcom_device) {
+        host_ptr = &ionmem;
+        fl |= CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM;
+        ionmem.ion_filedesc  = buf->flags;
+        ionmem.ion_hostptr   = buf->host;
+        debug(user_context) << "    clCreateBuffer host_ptr is " << ionmem.ion_hostptr << "\n";
+        size_t device_page_size = 0;
+        err = clGetDeviceInfo(ctx.device, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(device_page_size), &device_page_size, NULL);
+        if (err != CL_SUCCESS) {
+            error(user_context) << "CL: clGetDeviceInfo failed: "
+                                << get_opencl_error_name(err);
+            return err;
+        }
+        if((size_t)ionmem.ion_hostptr % device_page_size) {
+            debug(user_context) << "    clCreateBuffer host_ptr is not aligned to device_page_size " << (int)device_page_size << "\n";
+            err = CL_INVALID_HOST_PTR;
+            return err;
+        }
+        debug(user_context) << "    clCreateBuffer setting CL_MEM_USE_HOST_PTR|CL_MEM_EXT_HOST_PTR_QCOM flag\n";
+    }
+
+    // We assume a valid ION allocation has been passed down to us
+    if (buf->use_host_ptr_extension && ctx.is_qcom_device) {
+       ionmem.ext_host_ptr.allocation_type    = CL_MEM_ION_HOST_PTR_QCOM;
+       ionmem.ext_host_ptr.host_cache_policy  = CL_MEM_HOST_UNCACHED_QCOM;
+       if (buf->is_cached) {
+           ionmem.ext_host_ptr.host_cache_policy  = CL_MEM_HOST_WRITEBACK_QCOM;
+           debug(user_context) << "    clCreateBuffer setting is_cached|CL_MEM_HOST_WRITEBACK_QCOM flag\n";
+       }
+    }
+
+    debug(user_context) << "    clCreateBuffer flags -> " << fl << "\n";
+    cl_mem dev_ptr = clCreateBuffer(ctx.context, fl, size, host_ptr, &err);
+    if (err != CL_SUCCESS || dev_ptr == 0 ) {
         debug(user_context) << get_opencl_error_name(err) << "\n";
         error(user_context) << "CL: clCreateBuffer failed: "
                             << get_opencl_error_name(err);
@@ -1033,6 +1095,7 @@ WEAK int halide_opencl_run(void *user_context,
     }
 
     // Launch kernel
+    cl_event ev;
     debug(user_context)
         << "    clEnqueueNDRangeKernel "
         << blocksX << "x" << blocksY << "x" << blocksZ << ", "
@@ -1041,7 +1104,7 @@ WEAK int halide_opencl_run(void *user_context,
                                  // NDRange
                                  3, NULL, global_dim, local_dim,
                                  // Events
-                                 0, NULL, NULL);
+                                 0, NULL, &ev);
     debug(user_context) << get_opencl_error_name(err) << "\n";
 
     // Now that the kernel is enqueued, OpenCL is holding its own
@@ -1056,6 +1119,13 @@ WEAK int halide_opencl_run(void *user_context,
                             << get_opencl_error_name(err) << "\n";
         return err;
     }
+    err = clWaitForEvents(1,&ev);
+    if (err != CL_SUCCESS) {
+        error(user_context) << "CL: clWaitForEvents failed: "
+                            << get_opencl_error_name(err) << "\n";
+        return err;
+    }
+    debug(user_context) << "clWaitForEvents " << get_opencl_error_name(err) << "\n";
 
     debug(user_context) << "    Releasing kernel " << (void *)f << "\n";
     clReleaseKernel(f);
@@ -1108,7 +1178,7 @@ WEAK int halide_opencl_wrap_cl_mem(void *user_context, struct halide_buffer_t *b
 }
 
 WEAK int halide_opencl_detach_cl_mem(void *user_context, halide_buffer_t *buf) {
-    if (buf->device == NULL) {
+    if (buf->device == 0) {
         return 0;
     }
     halide_assert(user_context, buf->device_interface == &opencl_device_interface);
@@ -1120,7 +1190,7 @@ WEAK int halide_opencl_detach_cl_mem(void *user_context, halide_buffer_t *buf) {
 }
 
 WEAK uintptr_t halide_opencl_get_cl_mem(void *user_context, halide_buffer_t *buf) {
-    if (buf->device == NULL) {
+    if (buf->device == 0) {
         return 0;
     }
     halide_assert(user_context, buf->device_interface == &opencl_device_interface);

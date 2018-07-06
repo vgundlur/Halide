@@ -857,6 +857,9 @@ void CodeGen_LLVM::compile_buffer(const Buffer<> &buf) {
         ConstantPointerNull::get(device_interface_t_type->getPointerTo()), // device_interface
         create_binary_blob(data_blob, buf.name() + ".data", constant), // host
         ConstantInt::get(i64_t, halide_buffer_flag_host_dirty),  // flags
+        ConstantInt::get(i64_t, 0),                              // use_host_ptr_extension
+        ConstantInt::get(i64_t, 0),                              // read_only
+        ConstantInt::get(i64_t,0) ,                              // is_cached;
         ConstantStruct::get(type_t_type, type_fields),           // type
         ConstantInt::get(i32_t, buf.dimensions()),               // dimensions
         shape,                                                   // dim

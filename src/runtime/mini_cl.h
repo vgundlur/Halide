@@ -577,6 +577,36 @@ typedef struct _cl_buffer_region {
 #define CL_PROFILING_COMMAND_SUBMIT                 0x1281
 #define CL_PROFILING_COMMAND_START                  0x1282
 #define CL_PROFILING_COMMAND_END                    0x1283
+/* QCOM ION HOST Pointer Extension */
+#define CL_MEM_ION_HOST_PTR_QCOM                    0x40A8
+#define CL_MEM_EXT_HOST_PTR_QCOM                    (1 << 29)
+#define CL_MEM_HOST_UNCACHED_QCOM                   0x40A4
+#define CL_MEM_HOST_WRITEBACK_QCOM                  0x40A5
+#define CL_DEVICE_PAGE_SIZE_QCOM                    0x40A1
+
+
+typedef struct _cl_mem_ext_host_ptr {
+    // Type of external memory allocation.
+    // Legal values will be defined in layered extensions.
+    cl_uint  allocation_type;
+
+    // Host cache policy for this external memory allocation.
+    cl_uint  host_cache_policy;
+
+} cl_mem_ext_host_ptr;
+
+typedef struct _cl_mem_ion_host_ptr {
+    // Type of external memory allocation.
+    // Must be CL_MEM_ION_HOST_PTR_QCOM for ION allocations.
+    cl_mem_ext_host_ptr  ext_host_ptr;
+
+    // ION file descriptor
+    int ion_filedesc;
+
+    // Host pointer to the ION allocated memory
+    void *ion_hostptr;
+
+} cl_mem_ion_host_ptr;
 
 #ifdef __cplusplus
 }

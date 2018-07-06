@@ -1227,6 +1227,15 @@ typedef struct halide_buffer_t {
     /** flags with various meanings. */
     uint64_t flags;
 
+    /** Using this to enable host_ptr extension */
+    uint64_t use_host_ptr_extension;
+
+    /** Using this to indicate to the runtime that this buffer should be read-only for the GPU */
+    uint64_t read_only;
+
+    /** Using this to indicate whether the cache policy of the underlying ION allocation */
+    uint64_t is_cached;
+
     /** The type of each buffer element. */
     struct halide_type_t type;
 

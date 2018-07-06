@@ -276,6 +276,11 @@ WEAK int halide_device_and_host_malloc(void *user_context, struct halide_buffer_
 
     const halide_device_interface_t *current_interface = buf->device_interface;
 
+    // This is an allocation from runtime, not application code. Safe to set these to default values
+    buf->use_host_ptr_extension = 0;
+    buf->read_only = 0;
+    buf->is_cached = 0;
+
     // halide_device_malloc does not support switching interfaces.
     if (current_interface != NULL && current_interface != device_interface) {
         halide_error(user_context, "halide_device_and_host_malloc doesn't support switching interfaces\n");
