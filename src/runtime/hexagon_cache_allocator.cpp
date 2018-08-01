@@ -147,12 +147,10 @@ WEAK void *halide_locked_cache_malloc(void *user_context, size_t size) {
     // TODO Currently option to retry allocation is disabled, we will have to decide if can be
     // set by user or pipeline.
     bool retry = false;
-    halide_print(user_context, "halide_locked_cache_malloc\n");
     return hexagon_cache_pool_get(user_context, size, retry);
 }
 
 WEAK void halide_locked_cache_free(void *user_context, void *ptr) {
-    halide_print(user_context, "halide_locked_cache_free.\n");
     hexagon_cache_pool_put(user_context, ptr);
 }
 
