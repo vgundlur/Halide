@@ -1,5 +1,5 @@
-#include "Halide.h"
 #include <stdio.h>
+#include "Halide.h"
 
 using namespace Halide;
 
@@ -108,6 +108,122 @@ int main(int argc, char **argv) {
         // we can skip the y-1 case in all but the first iteration.
         if (count != 100 * 11) {
             printf("f was called %d times instead of %d times\n", count, 100*11);
+            return -1;
+        }
+    }
+
+    // Two independent producers.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1);
+        h(x) = f(x) + f(x+1) + g(x-2) + g(x+2);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(20);
+        constexpr int expected = 21 + 24;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Chain of f -> g -> consumer.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1) + f(x) + f(x+1);
+        h(x) = g(x-2) + g(x+2);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 15 + 14;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Same chain of f -> g -> consumer, but f doesn't slide.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1) + f(x);
+        h(x) = g(x-2) + g(x+2);
+
+        f.store_root().compute_at(g, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 14 + 14;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+
+    // Same as above, but f has an update.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        f(x) = min(f(x), call_counter(x, 1));
+        g(x) = call_counter(x, 2) + f(x);
+        h(x) = g(x-2) + g(x+2);
+
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 14 * 3;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Sliding g, but one of its dependencies (f) has a more complex required
+    // box, because it's also used by h with a different access pattern.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = f(x/2*2);
+        h(x) = g(x) + g(x+1) + f(x);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 11;
+        if (count != expected) {
+            printf("f was called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Two independent producers computed in a fused loop.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1);
+        h(x) = f(x) + f(x+2) + g(x-2) + g(x+1);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x).compute_with(f, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 12 + 13;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
             return -1;
         }
     }
