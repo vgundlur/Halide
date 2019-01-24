@@ -109,7 +109,7 @@ WEAK void halide_device_release(void *user_context, const halide_device_interfac
 /** Copy image data from device memory to host memory. This must be called
  * explicitly to copy back the results of a GPU-based filter. */
 WEAK int halide_copy_to_host(void *user_context, struct halide_buffer_t *buf) {
-    ScopedMutexLock lock(&device_copy_mutex);
+    //ScopedMutexLock lock(&device_copy_mutex);
 
     int result = debug_log_and_validate_buf(user_context, buf, "halide_copy_to_host");
     if (result != 0) {
@@ -176,7 +176,7 @@ WEAK int copy_to_device_already_locked(void *user_context,
 WEAK int halide_copy_to_device(void *user_context,
                                struct halide_buffer_t *buf,
                                const halide_device_interface_t *device_interface) {
-    ScopedMutexLock lock(&device_copy_mutex);
+    //ScopedMutexLock lock(&device_copy_mutex);
     return copy_to_device_already_locked(user_context, buf, device_interface);
 }
 
@@ -591,7 +591,7 @@ WEAK int halide_buffer_copy(void *user_context, struct halide_buffer_t *src,
                         << " interface " << dst_device_interface << "\n"
                         << " dst " << *dst << "\n";
 
-    ScopedMutexLock lock(&device_copy_mutex);
+    //ScopedMutexLock lock(&device_copy_mutex);
 
     if (dst_device_interface) {
         dst_device_interface->impl->use_module();
@@ -631,7 +631,7 @@ WEAK int halide_default_device_slice(void *user_context,
 WEAK int halide_device_crop(void *user_context,
                             const struct halide_buffer_t *src,
                             struct halide_buffer_t *dst) {
-    ScopedMutexLock lock(&device_copy_mutex);
+   // ScopedMutexLock lock(&device_copy_mutex);
 
     if (!src->device) {
         return 0;
@@ -661,7 +661,7 @@ WEAK int halide_device_slice(void *user_context,
                              const struct halide_buffer_t *src,
                              int slice_dim, int slice_pos,
                              struct halide_buffer_t *dst) {
-    ScopedMutexLock lock(&device_copy_mutex);
+    //ScopedMutexLock lock(&device_copy_mutex);
 
     if (!src->device) {
         return 0;
@@ -700,7 +700,7 @@ WEAK int halide_default_device_release_crop(void *user_context,
 WEAK int halide_device_release_crop(void *user_context,
                                     struct halide_buffer_t *buf) {
     if (buf->device) {
-        ScopedMutexLock lock(&device_copy_mutex);
+        //ScopedMutexLock lock(&device_copy_mutex);
         const struct halide_device_interface_t *interface = buf->device_interface;
         int result = interface->impl->device_release_crop(user_context, buf);
         buf->device = 0;

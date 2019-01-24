@@ -6,12 +6,12 @@
 #include "mini_hexagon_dma.h"
 #include "hexagon_dma_pool.h"
 #include "scoped_mutex_lock.h"
+#include "mini_qurt.h"
 
 namespace Halide { namespace Runtime { namespace Internal { namespace HexagonDma {
 
 extern WEAK halide_device_interface_t hexagon_dma_device_interface;
 
-#define descriptor_size 64
 
 // DMA device handle structure, which holds all the necessary frame related parameters.
 // To be used for DMA transfer.
@@ -49,111 +49,11 @@ inline dma_device_handle *malloc_device_handle() {
     return dev;
 }
 
-// Data Structure for chaining of DMA descriptors.
-typedef struct desc_pool {
-    void *descriptor;
-    bool used;
-    struct desc_pool *next;
-} desc_pool_t;
-
-typedef desc_pool_t *pdesc_pool;
-
-WEAK pdesc_pool dma_desc_pool = NULL;
-WEAK halide_mutex hexagon_desc_mutex;
-
 }}}}  // namespace Halide::Runtime::Internal::HexagonDma
 
 using namespace Halide::Runtime::Internal::HexagonDma;
 
 namespace {
-
-// Core logic for DMA descriptor Pooling. The idea is to reuse the Allocated cache for descriptors,
-// if it is free. In case of un availability of free descriptors, two new descriptors are allocated in the cache 
-// and make them available in the pool (128B is the minimum cache size that can be locked)
-void *desc_pool_get (void *user_context) {
-    ScopedMutexLock lock(&hexagon_desc_mutex);
-    pdesc_pool temp = dma_desc_pool;
-    pdesc_pool prev = NULL;
-    // Walk the list
-    while (temp != NULL) {
-        if (!temp->used) {
-            temp->used = true;
-            return (void*) temp->descriptor;
-        }
-        prev = temp;
-        temp = temp->next;
-    }
-    // If we are still here that means temp was null.
-    // We have to allocate two descriptors here, to lock a full cache line
-    temp = (pdesc_pool) malloc(sizeof(desc_pool_t));
-    if (temp == NULL) {
-        error(user_context) << "Hexagon: Out of memory (malloc failed for DMA descriptor pool)\n";
-        return NULL;
-    }
-    uint8_t *desc = (uint8_t *)HAP_cache_lock(sizeof(char) * descriptor_size * 2, NULL);
-    if (desc == NULL) {
-        free(temp);
-        error(user_context) << "Hexagon: Out of memory (HAP_cache_lock failed for descriptor)\n";
-        return NULL;
-    }
-    temp->descriptor = (void *)desc;
-    temp->used = true;
-
-    // Now allocate the second element in list
-    temp->next = (pdesc_pool) malloc(sizeof(desc_pool_t));
-    if (temp->next != NULL) {
-        (temp->next)->descriptor = (void *)(desc+descriptor_size);
-        (temp->next)->used = false;
-        (temp->next)->next = NULL;
-    } else {
-        // no need to throw error since we allocate two descriptor at a time
-        // but only use one
-        debug(user_context) << "Hexagon: malloc failed\n" ;
-    }
-
-    if (prev != NULL) {
-        prev->next = temp;
-    } else if (dma_desc_pool == NULL) {
-        dma_desc_pool = temp;
-    }
-    return (void *) temp->descriptor;
-}
-
-void desc_pool_put (void *user_context, void *desc) {
-    ScopedMutexLock lock(&hexagon_desc_mutex);
-    halide_assert(user_context, desc);
-    pdesc_pool temp = dma_desc_pool;
-    while (temp != NULL) {
-        if (temp->descriptor == desc) {
-            temp->used = false;
-            return;
-        }
-        temp = temp->next;
-    }
-    error(user_context) << "Hexagon: desc not found " << desc << "\n";
-}
-
-// DMA descriptor freeing logic, Two descriptors at a time will be freed. 
-void desc_pool_free (void *user_context) {
-    ScopedMutexLock lock(&hexagon_desc_mutex);
-    pdesc_pool temp = dma_desc_pool;
-    while (temp != NULL) {
-        pdesc_pool temp2 = temp;
-        temp = temp->next;
-        if (temp2->descriptor != NULL) {
-            HAP_cache_unlock(temp2->descriptor);
-        }
-        free(temp2);
-        temp2 = temp;
-        if (temp != NULL) {
-            temp = temp->next;
-            free(temp2);
-        }
-    }
-
-    // Mark pool is empty, to avoid re-freeing
-    dma_desc_pool = NULL;
-}
 
 // User ptovided Image format to DMA format conversion.
 inline t_eDmaFmt halide_hexagon_get_dma_format(void *user_context, const halide_hexagon_image_fmt_t format) {
@@ -254,10 +154,10 @@ int halide_hexagon_dma_wrapper (void *user_context, struct halide_buffer_t *src,
     // Assert if destination stride is a multipe of recommended stride
     halide_assert(user_context,((dst->dim[1].stride%roi_stride)== 0));
 
-    // Return NULL if descriptor is not allocated
-    void *desc_addr = desc_pool_get(user_context);
-    if (desc_addr == NULL) {
-        debug(user_context) << "Hexagon: DMA descriptor allocation error\n";
+    void *desc_addr = 0;
+    void *dma_engine = halide_hexagon_allocate_from_dma_pool(user_context, dev->dma_engine, &desc_addr);
+    if (!dma_engine) {
+        debug(user_context) << "Hexagon: Dma Engine Allocation Faliure\n";
         return halide_error_code_device_buffer_copy_failed;
     }
 
@@ -313,12 +213,15 @@ int halide_hexagon_dma_wrapper (void *user_context, struct halide_buffer_t *src,
             << " dst->dim[1].min: " << dst->dim[1].min << "\n" ;
     }
 
-    void *dma_engine = halide_hexagon_allocate_from_dma_pool(user_context, dev->dma_engine);
-    if (!dma_engine) {
-        debug(user_context) << "Hexagon: Dma Engine Allocation Faliure\n";
-        return halide_error_code_device_buffer_copy_failed;
-    }
-
+    print(NULL) << "ven" << dev->dma_engine
+                << " den" << dma_engine  
+                << " desc" << desc_addr  
+                << " cache" << stDmaTransferParm.pTcmDataBuf 
+                << " w" << dev->is_write
+                << " x" << stDmaTransferParm.u16RoiX
+                << " y" << stDmaTransferParm.u16RoiY  
+                << "\n" ;         
+ 
     debug(user_context)
         << "Hexagon: " << dma_engine << " transfer: " << stDmaTransferParm.pDescBuf << "\n";
     nRet = nDmaWrapper_DmaTransferSetup(dma_engine, &stDmaTransferParm);
@@ -341,8 +244,7 @@ int halide_hexagon_dma_wrapper (void *user_context, struct halide_buffer_t *src,
         return halide_error_code_device_buffer_copy_failed;
     }
 
-    desc_pool_put(user_context, desc_addr);
-    nRet = halide_hexagon_free_to_dma_pool(user_context, dma_engine, dev->dma_engine);
+    nRet = halide_hexagon_free_to_dma_pool(user_context, dma_engine, dev->dma_engine); 
     if (nRet != halide_error_code_success) {
         debug(user_context) << "halide_hexagon_free_from_dma_pool error:" << nRet << "\n";
         return nRet;
@@ -421,10 +323,6 @@ WEAK int halide_hexagon_dma_deallocate_engine(void *user_context, void *dma_engi
         << ", dma_engine: " << dma_engine << ")\n";
 
     halide_assert(user_context, dma_engine);
-
-    // Its safe to free descriptors here, even on 1st engine of multi-engines deallocation, since its called outside of pipeline
-    // If descriptors are needed on pipeline re-entry, the pool will also re-populate
-    desc_pool_free(user_context);
 
     // Free DMA Resources
     int err = halide_hexagon_free_dma_resource(user_context, dma_engine);
